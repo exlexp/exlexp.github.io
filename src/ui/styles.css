@@ -356,6 +356,11 @@ input:focus, textarea:focus, select:focus { border-color: var(--chat-blue); box-
 .language-switch button { min-width: 42px; height: 32px; border: 0; border-radius: 8px; background: transparent; color: var(--chat-muted); cursor: pointer; }
 .language-switch button.active { background: var(--chat-blue-soft); color: var(--chat-blue); }
 .field-note { color: var(--chat-muted); font-size: 12px; font-weight: 400; }
+.device-unlock-check { display: grid; grid-template-columns: 20px minmax(0, 1fr); align-items: start; gap: 10px; cursor: pointer; }
+.device-unlock-check input { width: 18px; height: 18px; margin: 2px 0 0; padding: 0; accent-color: var(--chat-accent); }
+.device-unlock-check span { display: grid; gap: 3px; }
+.device-unlock-check strong { color: var(--chat-text); font-size: 14px; }
+.device-unlock-check small { color: var(--chat-muted); font-size: 12px; font-weight: 400; line-height: 1.4; }
 .gate-divider { height: 36px; display: flex; align-items: center; gap: 10px; color: #a0a9b1; font-size: 12px; }
 .gate-divider::before, .gate-divider::after { content: ""; height: 1px; flex: 1; background: var(--chat-line); }
 .text-action { width: 100%; }

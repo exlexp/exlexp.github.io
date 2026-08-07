@@ -49,9 +49,16 @@ export function App() {
   useEffect(() => { viewState.current = { activeProfileId: data?.activeProfileId, screen, conversationId: selectedConversation }; }, [data?.activeProfileId, screen, selectedConversation]);
 
   useEffect(() => {
-    void vault.exists().then((exists) => setGate(exists ? 'unlock' : 'launch')).catch((reason) => {
-      setError(redactError(reason)); setGate('launch');
-    });
+    void (async () => {
+      try {
+        const exists = await vault.exists();
+        if (!exists) { setGate('launch'); return; }
+        if (await vault.tryDeviceUnlock()) { refresh(); setGate('open'); void requestDurableStorage(); return; }
+        setGate('unlock');
+      } catch (reason) {
+        setError(redactError(reason)); setGate('launch');
+      }
+    })();
     return networkPolicy.subscribe(setNetwork);
   }, []);
 
@@ -86,8 +93,8 @@ export function App() {
 
   useEffect(() => {
     if (gate !== 'open' || !data || data.settings.autoLockMinutes <= 0) return;
-    let timer = window.setTimeout(lock, data.settings.autoLockMinutes * 60_000);
-    const arm = () => { window.clearTimeout(timer); timer = window.setTimeout(lock, data.settings.autoLockMinutes * 60_000); };
+    let timer = window.setTimeout(() => void lock(), data.settings.autoLockMinutes * 60_000);
+    const arm = () => { window.clearTimeout(timer); timer = window.setTimeout(() => void lock(), data.settings.autoLockMinutes * 60_000); };
     window.addEventListener('pointerdown', arm, { passive: true });
     window.addEventListener('keydown', arm);
     return () => { window.clearTimeout(timer); window.removeEventListener('pointerdown', arm); window.removeEventListener('keydown', arm); };
@@ -116,24 +123,26 @@ export function App() {
     setProfileScope((scope) => scope === 'all' || snapshot.profiles.some((profile) => profile.id === scope) ? scope : snapshot.activeProfileId);
   }, []);
 
-  const createPersistent = async (password: string) => {
+  const createPersistent = async (password: string, rememberDevice: boolean) => {
     setError('');
-    try { await vault.create(password, language); refresh(); setGate('open'); void requestDurableStorage(); }
+    try { await vault.create(password, language); if (rememberDevice) await vault.enableDeviceUnlock(password); refresh(); setGate('open'); void requestDurableStorage(); }
     catch (reason) { setError(redactError(reason)); }
   };
 
   const createEphemeral = () => { vault.createEphemeral(language); refresh(); setGate('open'); };
 
-  const unlock = async (password: string) => {
+  const unlock = async (password: string, rememberDevice: boolean) => {
     setError('');
-    try { await vault.unlock(password); refresh(); setGate('open'); void requestDurableStorage(); }
+    try { await vault.unlock(password); if (rememberDevice) await vault.enableDeviceUnlock(password); else await vault.disableDeviceUnlock(); refresh(); setGate('open'); void requestDurableStorage(); }
     catch (reason) { setError(redactError(reason)); }
   };
 
-  function lock() {
+  async function lock() {
     for (const client of xmppClients.current.values()) client.stop();
     for (const client of toxClients.current.values()) void client.stop();
-    xmppClients.current.clear(); toxClients.current.clear(); vault.lock(); setData(undefined); setGate('unlock');
+    xmppClients.current.clear(); toxClients.current.clear();
+    await vault.disableDeviceUnlock().catch(() => undefined);
+    vault.lock(); setData(undefined); setGate('unlock');
   }
 
   if (gate === 'loading') return <div className="boot"><span className="pulse"/> {BRAND.productName} / LOCAL BOOT</div>;
@@ -637,7 +646,7 @@ export function App() {
           {screen === 'chats' && <Messenger data={data} scope={profileScope} selected={selectedConversation} onBack={() => setSelectedConversation(undefined)} selectConversation={selectConversation} setScreen={setScreen} sendMessage={sendMessage} setSource={setConversationSource} saveDraft={saveDraft} t={t}/>} 
           {screen === 'accounts' && <Accounts profile={currentProfile} addXmpp={addXmpp} connectXmpp={(account) => connectXmpp(account, currentProfile.id)} addTox={addTox} connectTox={(account) => connectTox(account, currentProfile.id)} disconnectAccount={disconnectAccount} removeAccount={removeAccount} exportAccount={async (account) => { try { let exportPassword: string | undefined; if (!vault.isPersistent) { exportPassword = window.prompt(languageHint(t, 'Придумайте пароль для зашифрованной копии (минимум 10 символов)', 'Create a password for the encrypted backup (at least 10 characters)'))?.trim(); if (!exportPassword) return; } downloadText(await vault.exportAccount(currentProfile.id, account.id, exportPassword), `${safeFilename(account.alias)}.rlaccount`); } catch (reason) { setError(redactError(reason)); } }} t={t}/>}
           {screen === 'contacts' && <Contacts profile={currentProfile} acceptToxFriend={acceptToxFriend} rejectToxFriend={rejectToxFriend} addXmppContact={addXmppContact} addToxFriend={addToxFriend} openContact={openContact} renameContact={renameContact} goToAccounts={() => setScreen('accounts')} t={t}/>}
-          {screen === 'privacy' && <Privacy data={data} profile={currentProfile} network={network} t={t} onLock={lock} onWipe={async () => { await vault.wipe(); setData(undefined); setGate('launch'); }} onExport={async () => downloadText(await vault.exportEncrypted(), 'relayless-vault.rlvault')}/>} 
+          {screen === 'privacy' && <Privacy data={data} profile={currentProfile} network={network} t={t} onLock={() => void lock()} onWipe={async () => { await vault.wipe(); setData(undefined); setGate('launch'); }} onExport={async () => downloadText(await vault.exportEncrypted(), 'relayless-vault.rlvault')}/>}
           {screen === 'plugins' && <Plugins data={data} t={t} onInstall={async (source, granted) => { const manifest = parsePluginManifest(source); await vault.update((draft) => { draft.plugins = installPlugin(manifest, granted, draft.plugins); }); refresh(); }} onToggle={async (id) => { await vault.update((draft) => { const plugin = draft.plugins.find((item) => item.manifest.id === id); if (plugin) plugin.enabled = !plugin.enabled; }); refresh(); }} onRemove={async (id) => { await vault.update((draft) => { draft.plugins = draft.plugins.filter((item) => item.manifest.id !== id); }); refresh(); }}/>} 
           {screen === 'settings' && <Settings data={data} profile={currentProfile} t={t} onSave={updateSettings} onProfileUpdate={async (settings) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.settings = settings; }); refresh(); }} onRename={async (name) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) { profile.name = name; profile.initials = name.slice(0, 2).toUpperCase(); } }); refresh(); }} onPin={async () => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.pinned = !profile.pinned; }); refresh(); }} onAvatar={async (avatar) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.avatar = avatar; }); refresh(); }} onLockProfile={async () => { for (const account of currentProfile.accounts) { const key = `${currentProfile.id}:${account.id}`; xmppClients.current.get(key)?.stop(); xmppClients.current.delete(key); void toxClients.current.get(key)?.stop(); toxClients.current.delete(key); } await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) { profile.locked = true; profile.runtimeState = 'locked'; } }); refresh(); setProfileScope('all'); setSelectedConversation(undefined); setScreen('chats'); }} onDuplicate={async () => { await vault.update((draft) => duplicateProfileSettings(draft, currentProfile.id, `${currentProfile.name} copy`)); refresh(); }} onEphemeral={() => void createNewProfile(true)} onDelete={async () => { for (const account of currentProfile.accounts) { const key = `${currentProfile.id}:${account.id}`; xmppClients.current.get(key)?.stop(); void toxClients.current.get(key)?.stop(); } await vault.update((draft) => deleteProfile(draft, currentProfile.id)); refresh(); }} onExportProfile={async () => downloadText(await vault.exportProfile(currentProfile.id), `${safeFilename(currentProfile.name)}.rlprofile`)} onImportProfile={async (text) => { const id = await vault.importProfile(text); refresh(); await selectProfile(id); }}/>} 
           </WorkspaceErrorBoundary>
@@ -674,16 +683,16 @@ class WorkspaceErrorBoundary extends Component<{ resetKey: string; language: Lan
   }
 }
 
-function FirstLaunch({ language, setLanguage, error, createPersistent, createEphemeral }: { language: Language; setLanguage: (value: Language) => void; error: string; createPersistent: (password: string) => Promise<void>; createEphemeral: () => void }) {
-  const [password, setPassword] = useState(''); const t = copy[language];
+function FirstLaunch({ language, setLanguage, error, createPersistent, createEphemeral }: { language: Language; setLanguage: (value: Language) => void; error: string; createPersistent: (password: string, rememberDevice: boolean) => Promise<void>; createEphemeral: () => void }) {
+  const [password, setPassword] = useState(''); const [rememberDevice, setRememberDevice] = useState(true); const t = copy[language];
   const isRu = language === 'ru';
-  return <div className="gate-page"><main className="gate-card"><div className="language-switch"><button className={language === 'ru' ? 'active' : ''} onClick={() => setLanguage('ru')}>RU</button><button className={language === 'en' ? 'active' : ''} onClick={() => setLanguage('en')}>EN</button></div><h1>{isRu ? 'Начать пользоваться' : 'Get started'}</h1><p>{isRu ? 'Придумайте пароль. Он защищает ваши чаты на этом устройстве.' : 'Create a password to protect your chats on this device.'}</p><form onSubmit={(event) => { event.preventDefault(); void createPersistent(password); }}><label>{isRu ? 'Пароль' : 'Password'}<input type="password" autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} required minLength={10} placeholder="••••••••••••"/></label><span className="field-note">{t.passwordHint}</span><button className="primary" type="submit">{isRu ? 'Продолжить' : 'Continue'}</button></form><div className="gate-divider"><span>{isRu ? 'или' : 'or'}</span></div><button className="text-action" onClick={createEphemeral}>{isRu ? 'Открыть без сохранения' : 'Open without saving'}</button>{error && <div className="inline-error">{error}</div>}</main></div>;
+  return <div className="gate-page"><main className="gate-card"><div className="language-switch"><button className={language === 'ru' ? 'active' : ''} onClick={() => setLanguage('ru')}>RU</button><button className={language === 'en' ? 'active' : ''} onClick={() => setLanguage('en')}>EN</button></div><h1>{isRu ? 'Начать пользоваться' : 'Get started'}</h1><p>{isRu ? 'Придумайте пароль. Он защищает ваши чаты на этом устройстве.' : 'Create a password to protect your chats on this device.'}</p><form onSubmit={(event) => { event.preventDefault(); void createPersistent(password, rememberDevice); }}><label>{isRu ? 'Пароль' : 'Password'}<input type="password" autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} required minLength={10} placeholder="••••••••••••"/></label><span className="field-note">{t.passwordHint}</span><label className="device-unlock-check"><input type="checkbox" checked={rememberDevice} onChange={(event) => setRememberDevice(event.target.checked)}/><span><strong>{isRu ? 'Запомнить на этом устройстве' : 'Remember on this device'}</strong><small>{isRu ? 'После обновления страница откроется сама. Блокировка отключит автодоступ.' : 'Refreshes will open automatically. Locking disables automatic access.'}</small></span></label><button className="primary" type="submit">{isRu ? 'Продолжить' : 'Continue'}</button></form><div className="gate-divider"><span>{isRu ? 'или' : 'or'}</span></div><button className="text-action" onClick={createEphemeral}>{isRu ? 'Открыть без сохранения' : 'Open without saving'}</button>{error && <div className="inline-error">{error}</div>}</main></div>;
 }
 
-function Unlock({ language, setLanguage, error, unlock }: { language: Language; setLanguage: (value: Language) => void; error: string; unlock: (password: string) => Promise<void> }) {
-  const [password, setPassword] = useState('');
+function Unlock({ language, setLanguage, error, unlock }: { language: Language; setLanguage: (value: Language) => void; error: string; unlock: (password: string, rememberDevice: boolean) => Promise<void> }) {
+  const [password, setPassword] = useState(''); const [rememberDevice, setRememberDevice] = useState(true);
   const isRu = language === 'ru';
-  return <div className="unlock-page"><main className="unlock-box"><div className="language-switch"><button className={language === 'ru' ? 'active' : ''} onClick={() => setLanguage('ru')}>RU</button><button className={language === 'en' ? 'active' : ''} onClick={() => setLanguage('en')}>EN</button></div><div className="unlock-avatar"><LockIcon/></div><h1>{isRu ? 'Введите пароль' : 'Enter password'}</h1><p>{isRu ? 'Чтобы открыть ваши чаты' : 'To open your chats'}</p><form onSubmit={(event) => { event.preventDefault(); void unlock(password); }}><input autoFocus type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="••••••••••••"/><button className="primary" type="submit">{isRu ? 'Открыть' : 'Open'}</button></form>{error && <div className="inline-error">{error}</div>}</main></div>;
+  return <div className="unlock-page"><main className="unlock-box"><div className="language-switch"><button className={language === 'ru' ? 'active' : ''} onClick={() => setLanguage('ru')}>RU</button><button className={language === 'en' ? 'active' : ''} onClick={() => setLanguage('en')}>EN</button></div><div className="unlock-avatar"><LockIcon/></div><h1>{isRu ? 'Введите пароль' : 'Enter password'}</h1><p>{isRu ? 'Чтобы открыть ваши чаты' : 'To open your chats'}</p><form onSubmit={(event) => { event.preventDefault(); void unlock(password, rememberDevice); }}><input autoFocus type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="••••••••••••"/><label className="device-unlock-check"><input type="checkbox" checked={rememberDevice} onChange={(event) => setRememberDevice(event.target.checked)}/><span><strong>{isRu ? 'Запомнить на этом устройстве' : 'Remember on this device'}</strong><small>{isRu ? 'Не спрашивать пароль после обновления страницы' : 'Do not ask after refreshing the page'}</small></span></label><button className="primary" type="submit">{isRu ? 'Открыть' : 'Open'}</button></form>{error && <div className="inline-error">{error}</div>}</main></div>;
 }
 
 function Messenger({ data, scope, selected, onBack, selectConversation, setScreen, sendMessage, setSource, saveDraft, t }: { data: VaultData; scope: ProfileScope; selected?: string; onBack: () => void; selectConversation: (profileId: string, conversationId: string) => Promise<void>; setScreen: (screen: Screen) => void; sendMessage: (profileId: string, conversation: Conversation, body: string, sourceAccountId: string) => Promise<void>; setSource: (profileId: string, conversationId: string, accountId: string) => Promise<void>; saveDraft: (profileId: string, conversationId: string, body: string) => Promise<void>; t: typeof copy[Language] }) {

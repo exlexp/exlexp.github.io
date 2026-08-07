@@ -20,6 +20,30 @@ describe('vault persistence', () => {
     expect(vault.snapshot.profiles[0]?.accounts[0]?.alias).toBe('Alice');
   });
 
+  it('unlocks after a refresh with a non-exportable device key', async () => {
+    const password = 'a sufficiently long password';
+    await vault.create(password, 'en', { iterations: 1, memoryKiB: 64, parallelism: 1 });
+    await vault.update((draft) => { draft.profiles[0]!.name = 'Remembered locally'; });
+    await vault.enableDeviceUnlock(password);
+    vault.lock();
+
+    const refreshedVault = new Vault();
+    expect(await refreshedVault.tryDeviceUnlock()).toBe(true);
+    expect(refreshedVault.snapshot.profiles[0]?.name).toBe('Remembered locally');
+    refreshedVault.lock();
+  });
+
+  it('forgets device unlock when explicitly disabled', async () => {
+    const password = 'a sufficiently long password';
+    await vault.create(password, 'en', { iterations: 1, memoryKiB: 64, parallelism: 1 });
+    await vault.enableDeviceUnlock(password);
+    await vault.disableDeviceUnlock();
+    vault.lock();
+
+    const refreshedVault = new Vault();
+    expect(await refreshedVault.tryDeviceUnlock()).toBe(false);
+  });
+
   it('keeps ephemeral data out of IndexedDB', async () => {
     vault.createEphemeral('ru');
     await vault.update((draft) => { draft.profiles[0]!.messages.push({ id: 'm', conversationId: 'c', direction: 'incoming', body: 'memory only', timestamp: 1, delivery: 'delivered' }); });

@@ -14,10 +14,21 @@ import {
   type EnvelopeCipher,
   type KdfParameters,
 } from './crypto';
+import { base64ToBytes, bytesToBase64, clearBytes, decodeUtf8, randomBytes, toArrayBuffer, utf8 } from './encoding';
 
 const DB_NAME = 'relayless-local-vault';
 const STORE_NAME = 'encrypted';
+const DEVICE_STORE_NAME = 'device-unlock';
 const RECORD_KEY = 'vault';
+const DEVICE_KEY_RECORD = 'key';
+const DEVICE_UNLOCK_RECORD = 'wrapped-password';
+const DEVICE_UNLOCK_AAD = utf8('relayless:device-unlock:1');
+
+interface WrappedDeviceUnlock {
+  version: 1;
+  nonce: string;
+  ciphertext: string;
+}
 
 type Mode = 'persistent' | 'ephemeral';
 
@@ -73,6 +84,68 @@ export class Vault {
     this.mode = 'persistent';
   }
 
+  async enableDeviceUnlock(password: string): Promise<void> {
+    if (!this.data || this.mode !== 'persistent') throw new Error('Persistent vault is not unlocked');
+    const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    const nonce = randomBytes(12);
+    const plaintext = utf8(password);
+    try {
+      const ciphertext = await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv: toArrayBuffer(nonce), additionalData: toArrayBuffer(DEVICE_UNLOCK_AAD), tagLength: 128 },
+        key,
+        toArrayBuffer(plaintext),
+      );
+      const record: WrappedDeviceUnlock = { version: 1, nonce: bytesToBase64(nonce), ciphertext: bytesToBase64(new Uint8Array(ciphertext)) };
+      const db = await this.openDatabase();
+      const transaction = db.transaction(DEVICE_STORE_NAME, 'readwrite');
+      await transaction.store.put(key, DEVICE_KEY_RECORD);
+      await transaction.store.put(record, DEVICE_UNLOCK_RECORD);
+      await transaction.done;
+    } finally {
+      clearBytes(nonce);
+      clearBytes(plaintext);
+    }
+  }
+
+  async tryDeviceUnlock(): Promise<boolean> {
+    const db = await this.openDatabase();
+    const transaction = db.transaction(DEVICE_STORE_NAME, 'readonly');
+    const key = await transaction.store.get(DEVICE_KEY_RECORD) as CryptoKey | undefined;
+    const record = await transaction.store.get(DEVICE_UNLOCK_RECORD) as WrappedDeviceUnlock | undefined;
+    await transaction.done;
+    if (!key || !record) return false;
+
+    let nonce: Uint8Array | undefined;
+    let plaintext: Uint8Array | undefined;
+    try {
+      if (key.extractable || key.algorithm.name !== 'AES-GCM' || !key.usages.includes('decrypt')) throw new Error('Invalid device key');
+      if (record.version !== 1 || record.nonce.length > 64 || record.ciphertext.length > 4096) throw new Error('Invalid device unlock record');
+      nonce = base64ToBytes(record.nonce);
+      if (nonce.byteLength !== 12) throw new Error('Invalid device unlock nonce');
+      plaintext = new Uint8Array(await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: toArrayBuffer(nonce), additionalData: toArrayBuffer(DEVICE_UNLOCK_AAD), tagLength: 128 },
+        key,
+        toArrayBuffer(base64ToBytes(record.ciphertext)),
+      ));
+      await this.unlock(decodeUtf8(toArrayBuffer(plaintext)));
+      return true;
+    } catch {
+      await this.disableDeviceUnlock();
+      return false;
+    } finally {
+      if (nonce) clearBytes(nonce);
+      if (plaintext) clearBytes(plaintext);
+    }
+  }
+
+  async disableDeviceUnlock(): Promise<void> {
+    const db = await this.openDatabase();
+    const transaction = db.transaction(DEVICE_STORE_NAME, 'readwrite');
+    await transaction.store.delete(DEVICE_KEY_RECORD);
+    await transaction.store.delete(DEVICE_UNLOCK_RECORD);
+    await transaction.done;
+  }
+
   async update(mutator: (draft: VaultData) => void): Promise<void> {
     const operation = this.mutationQueue.then(async () => {
       if (!this.data) throw new Error('Vault is locked');
@@ -89,6 +162,8 @@ export class Vault {
     this.data = undefined;
     this.password = undefined;
     this.cipher = undefined;
+    this.db?.close();
+    this.db = undefined;
   }
 
   async changePassword(currentPassword: string, nextPassword: string): Promise<void> {
@@ -100,6 +175,7 @@ export class Vault {
     this.password = nextPassword;
     this.cipher = cipher;
     await this.persist();
+    await this.disableDeviceUnlock();
   }
 
   async exportEncrypted(): Promise<string> {
@@ -182,6 +258,7 @@ export class Vault {
     this.password = password;
     this.cipher = cipher;
     this.mode = 'persistent';
+    await this.disableDeviceUnlock();
   }
 
   async wipe(): Promise<void> {
@@ -201,9 +278,14 @@ export class Vault {
 
   private async openDatabase(): Promise<IDBPDatabase> {
     if (!this.db) {
-      this.db = await openDB(DB_NAME, 1, {
+      this.db = await openDB(DB_NAME, 2, {
         upgrade(database) {
           if (!database.objectStoreNames.contains(STORE_NAME)) database.createObjectStore(STORE_NAME);
+          if (!database.objectStoreNames.contains(DEVICE_STORE_NAME)) database.createObjectStore(DEVICE_STORE_NAME);
+        },
+        blocking: () => {
+          this.db?.close();
+          this.db = undefined;
         },
       });
     }
