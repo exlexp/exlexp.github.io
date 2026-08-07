@@ -72,6 +72,7 @@ function bridge(webSocket: WebSocket, tcp: Socket): void {
   const writer = tcp.writable.getWriter();
   let writeChain = Promise.resolve();
   let closed = false;
+  let queuedWriteBytes = 0;
 
   const close = (code = 1000, reason = 'closed') => {
     if (closed) return;
@@ -83,14 +84,20 @@ function bridge(webSocket: WebSocket, tcp: Socket): void {
 
   webSocket.addEventListener('message', (event) => {
     if (closed || typeof event.data === 'string') { close(1003, 'binary frames required'); return; }
+    const announcedBytes = event.data instanceof ArrayBuffer ? event.data.byteLength : event.data.size;
+    if (announcedBytes > MAX_BUFFERED_BYTES || queuedWriteBytes + announcedBytes > MAX_BUFFERED_BYTES) {
+      close(1009, 'relay buffer limit exceeded');
+      return;
+    }
+    queuedWriteBytes += announcedBytes;
     writeChain = writeChain
       .then(async () => {
         const bytes = event.data instanceof ArrayBuffer
           ? new Uint8Array(event.data)
           : new Uint8Array(await event.data.arrayBuffer());
-        if (bytes.byteLength > MAX_BUFFERED_BYTES) throw new Error('frame too large');
         await writer.write(bytes);
       })
+      .finally(() => { queuedWriteBytes = Math.max(0, queuedWriteBytes - announcedBytes); })
       .catch(() => close(1011, 'relay write failed'));
   });
   webSocket.addEventListener('close', () => close());
@@ -102,7 +109,10 @@ function bridge(webSocket: WebSocket, tcp: Socket): void {
       while (!closed) {
         const { done, value } = await reader.read();
         if (done) break;
-        if (value.byteLength) webSocket.send(value);
+        if (value.byteLength) {
+          if (webSocket.bufferedAmount > MAX_BUFFERED_BYTES) throw new Error('websocket buffer limit exceeded');
+          webSocket.send(value);
+        }
       }
       close();
     } catch {

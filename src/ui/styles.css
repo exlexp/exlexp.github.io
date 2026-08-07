@@ -126,6 +126,8 @@ input:focus, textarea:focus, select:focus { border-color: var(--chat-blue); box-
 .back-button { display: none; width: 34px; height: 34px; place-content: center; border: 0; border-radius: 50%; background: transparent; color: var(--chat-muted); cursor: pointer; }
 .back-button svg { transform: rotate(180deg); width: 18px; }
 .messages { flex: 1; min-height: 0; overflow: auto; padding: 24px clamp(18px, 7vw, 90px); display: flex; flex-direction: column; gap: 7px; }
+.load-older { align-self: center; margin: 2px 0 10px; padding: 7px 12px; border: 0; border-radius: 15px; background: rgba(255,255,255,.9); color: var(--chat-blue); font-size: 12px; font-weight: 650; box-shadow: 0 1px 3px rgba(26,48,66,.1); cursor: pointer; }
+.load-older:hover { background: #fff; }
 .messages article { max-width: min(560px, 78%); align-self: flex-start; animation: message-in 180ms cubic-bezier(.2,.8,.3,1) both; }
 .messages article.outgoing { align-self: flex-end; }
 .messages p { margin: 0; padding: 9px 11px 7px; border-radius: 14px 14px 14px 4px; background: #fff; box-shadow: 0 1px 1px rgba(25,45,61,.08); line-height: 1.42; overflow-wrap: anywhere; white-space: pre-wrap; }
@@ -226,7 +228,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--chat-blue); box-
 .account-row { min-height: 70px; padding: 10px 14px; display: grid; grid-template-columns: 46px minmax(0,1fr) auto auto; align-items: center; gap: 12px; border-bottom: 1px solid var(--chat-line); }
 .account-row:last-child { border-bottom: 0; }
 .account-row .chat-avatar { width: 42px; height: 42px; }
-.account-row > div:nth-child(2), .contact-row > span:nth-child(2) { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.account-row > div:nth-child(2), .contact-copy { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .account-row small, .contact-row small { color: var(--chat-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .account-row .connection-note { color: var(--chat-danger); }
 .account-actions { display: flex; align-items: center; gap: 5px; }
@@ -243,10 +245,21 @@ input:focus, textarea:focus, select:focus { border-color: var(--chat-blue); box-
 .state.online, .state.open { color: var(--chat-green); }
 .state.starting, .state.connecting, .state.authenticating, .state.reconnecting { color: var(--chat-blue); }
 .state.error, .state.failed { color: var(--chat-danger); }
-.contact-row { width: 100%; min-height: 70px; padding: 10px 15px; display: grid; grid-template-columns: 46px minmax(0,1fr) auto; align-items: center; gap: 13px; border: 0; border-bottom: 1px solid var(--chat-line); background: #fff; text-align: left; cursor: pointer; }
+.contact-row { width: 100%; min-height: 70px; padding-right: 8px; display: grid; grid-template-columns: minmax(0,1fr) 34px; align-items: center; gap: 4px; border-bottom: 1px solid var(--chat-line); background: #fff; text-align: left; }
 .contact-row:hover { background: #f7f9fa; }
 .contact-row:last-child { border-bottom: 0; }
 .contact-row .chat-avatar { width: 44px; height: 44px; }
+.contact-open { min-width: 0; min-height: 69px; padding: 10px 7px 10px 15px; display: grid; grid-template-columns: 46px minmax(0,1fr) auto; align-items: center; gap: 13px; border: 0; background: transparent; text-align: left; cursor: pointer; }
+.contact-edit-button { width: 32px; height: 32px; display: grid; place-items: center; border: 0; border-radius: 50%; background: transparent; color: var(--chat-muted); cursor: pointer; opacity: 0; transition: opacity 150ms ease, background 150ms ease, color 150ms ease; }
+.contact-row:hover .contact-edit-button, .contact-edit-button:focus-visible, .contact-row.editing .contact-edit-button { opacity: 1; }
+.contact-edit-button:hover { background: var(--chat-blue-soft); color: var(--chat-blue); }
+.contact-edit-button.save { color: var(--chat-blue); }
+.contact-edit-button:disabled { opacity: .35; cursor: default; }
+.contact-edit-button svg { width: 17px; height: 17px; }
+.contact-row.editing { padding: 10px 12px 10px 15px; grid-template-columns: 46px minmax(0,1fr); gap: 13px; background: #fff; }
+.contact-rename-form { min-width: 0; display: flex; align-items: center; gap: 7px; }
+.contact-rename-form input { min-width: 0; flex: 1; height: 40px; }
+.contact-rename-form > div { display: flex; gap: 2px; }
 .presence-dot { width: 9px; height: 9px; border-radius: 50%; background: #c1c8ce; }
 .presence-dot.online { background: var(--chat-green); }
 .presence-dot.away { background: #e4a94f; }

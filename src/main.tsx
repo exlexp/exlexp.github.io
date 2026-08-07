@@ -6,6 +6,11 @@ import './ui/styles.css';
 
 installSameOriginTrustedTypesPolicy();
 
+if (window.top !== window.self) {
+  document.documentElement.replaceChildren();
+  throw new Error('Relayless cannot run inside a third-party frame');
+}
+
 const root = document.getElementById('root');
 if (!root) throw new Error('Application root is missing');
 

@@ -3,10 +3,15 @@ import { migrateVaultData, serializableVault } from '../models/profiles';
 import { createEmptyVault, type LocalProfile, type VaultData } from '../models/types';
 import {
   decryptEnvelope,
+  decryptEnvelopeWithCipher,
+  createEnvelopeCipher,
   encryptEnvelope,
+  encryptEnvelopeWithCipher,
+  openEnvelopeCipher,
   parseEnvelope,
   serializeEnvelope,
   type EncryptedEnvelope,
+  type EnvelopeCipher,
   type KdfParameters,
 } from './crypto';
 
@@ -21,6 +26,8 @@ export class Vault {
   private password: string | undefined;
   private db: IDBPDatabase | undefined;
   private mode: Mode = 'persistent';
+  private mutationQueue: Promise<void> = Promise.resolve();
+  private cipher: EnvelopeCipher | undefined;
 
   get isUnlocked(): boolean {
     return this.data !== undefined;
@@ -40,35 +47,44 @@ export class Vault {
     this.mode = 'persistent';
     this.data = createEmptyVault(language);
     this.password = password;
-    await this.persist(kdf);
+    this.cipher = await createEnvelopeCipher(password, kdf);
+    await this.persist();
   }
 
   createEphemeral(language: 'ru' | 'en'): void {
     this.mode = 'ephemeral';
     this.data = createEmptyVault(language);
     this.password = undefined;
+    this.cipher = undefined;
   }
 
   async unlock(password: string): Promise<void> {
     const db = await this.openDatabase();
     const envelope = (await db.get(STORE_NAME, RECORD_KEY)) as EncryptedEnvelope | undefined;
     if (!envelope) throw new Error('No persistent vault exists');
-    this.data = migrateVaultData(await decryptEnvelope<unknown>(envelope, password));
+    const cipher = await openEnvelopeCipher(envelope, password);
+    this.data = migrateVaultData(await decryptEnvelopeWithCipher<unknown>(envelope, cipher));
     this.password = password;
+    this.cipher = cipher;
     this.mode = 'persistent';
   }
 
   async update(mutator: (draft: VaultData) => void): Promise<void> {
-    if (!this.data) throw new Error('Vault is locked');
-    const next = structuredClone(this.data);
-    mutator(next);
-    this.data = next;
-    if (this.mode === 'persistent') await this.persist();
+    const operation = this.mutationQueue.then(async () => {
+      if (!this.data) throw new Error('Vault is locked');
+      const next = structuredClone(this.data);
+      mutator(next);
+      this.data = next;
+      if (this.mode === 'persistent') await this.persist();
+    });
+    this.mutationQueue = operation.catch(() => undefined);
+    return operation;
   }
 
   lock(): void {
     this.data = undefined;
     this.password = undefined;
+    this.cipher = undefined;
   }
 
   async changePassword(currentPassword: string, nextPassword: string): Promise<void> {
@@ -76,12 +92,15 @@ export class Vault {
     const db = await this.openDatabase();
     const envelope = (await db.get(STORE_NAME, RECORD_KEY)) as EncryptedEnvelope;
     await decryptEnvelope(envelope, currentPassword);
+    const cipher = await createEnvelopeCipher(nextPassword);
     this.password = nextPassword;
+    this.cipher = cipher;
     await this.persist();
   }
 
   async exportEncrypted(): Promise<string> {
     if (this.mode !== 'persistent') throw new Error('Ephemeral profiles cannot be exported');
+    await this.mutationQueue;
     const db = await this.openDatabase();
     const envelope = (await db.get(STORE_NAME, RECORD_KEY)) as EncryptedEnvelope | undefined;
     if (!envelope) throw new Error('No persistent vault exists');
@@ -123,24 +142,27 @@ export class Vault {
 
   async importEncrypted(serialized: string, password: string): Promise<void> {
     const envelope = parseEnvelope(serialized);
-    const data = migrateVaultData(await decryptEnvelope<unknown>(envelope, password));
+    const cipher = await openEnvelopeCipher(envelope, password);
+    const data = migrateVaultData(await decryptEnvelopeWithCipher<unknown>(envelope, cipher));
     const db = await this.openDatabase();
     await db.put(STORE_NAME, envelope, RECORD_KEY);
     this.data = data;
     this.password = password;
+    this.cipher = cipher;
     this.mode = 'persistent';
   }
 
   async wipe(): Promise<void> {
+    await this.mutationQueue.catch(() => undefined);
     this.lock();
     this.db?.close();
     this.db = undefined;
     await deleteDB(DB_NAME);
   }
 
-  private async persist(kdf?: KdfParameters): Promise<void> {
-    if (!this.data || !this.password) throw new Error('Persistent vault is not unlocked');
-    const envelope = await encryptEnvelope(serializableVault(this.data), this.password, kdf);
+  private async persist(): Promise<void> {
+    if (!this.data || !this.password || !this.cipher) throw new Error('Persistent vault is not unlocked');
+    const envelope = await encryptEnvelopeWithCipher(serializableVault(this.data), this.cipher);
     const db = await this.openDatabase();
     await db.put(STORE_NAME, envelope, RECORD_KEY);
   }

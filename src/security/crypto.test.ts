@@ -22,4 +22,10 @@ describe('encrypted envelope', () => {
     envelope.ciphertext = `${envelope.ciphertext.slice(0, -2)}AA`;
     await expect(decryptEnvelope(envelope, 'the correct password')).rejects.toThrow(/incorrect|damaged/i);
   });
+
+  it('rejects attacker-controlled resource-heavy KDF parameters before deriving a key', async () => {
+    const envelope = await encryptEnvelope({ ok: true }, 'the correct password', TEST_KDF);
+    envelope.kdfParameters.memoryKiB = 1024 * 1024;
+    await expect(decryptEnvelope(envelope, 'the correct password')).rejects.toThrow(/unsafe/i);
+  });
 });

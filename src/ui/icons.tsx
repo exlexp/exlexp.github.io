@@ -12,12 +12,14 @@ import {
   LockKeyhole,
   MessageCircle,
   Plus,
+  Pencil,
   Puzzle,
   Search,
   SendHorizontal,
   Settings,
   ShieldCheck,
   UsersRound,
+  X,
 } from 'lucide-react';
 import { siXmpp } from 'simple-icons';
 
@@ -29,6 +31,8 @@ export const SettingsIcon = Settings;
 export const LockIcon = LockKeyhole;
 export const SendIcon = SendHorizontal;
 export const PlusIcon = Plus;
+export const EditIcon = Pencil;
+export const CancelIcon = X;
 export const DownloadIcon = Download;
 export const SearchIcon = Search;
 export const ArrowIcon = ArrowRight;
