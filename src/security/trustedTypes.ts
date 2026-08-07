@@ -1,6 +1,12 @@
-interface TrustedTypesPolicyFactoryLike {
-  createPolicy(name: string, rules: { createScriptURL(value: string): string }): unknown;
+interface TrustedTypesPolicyLike {
+  createHTML?(value: string): unknown;
 }
+
+interface TrustedTypesPolicyFactoryLike {
+  createPolicy(name: string, rules: { createScriptURL?(value: string): string; createHTML?(value: string): string }): TrustedTypesPolicyLike;
+}
+
+let xmppXmlPolicy: TrustedTypesPolicyLike | undefined;
 
 export function installSameOriginTrustedTypesPolicy(): void {
   const factory = (globalThis as unknown as { trustedTypes?: TrustedTypesPolicyFactoryLike }).trustedTypes;
@@ -16,4 +22,17 @@ export function installSameOriginTrustedTypesPolicy(): void {
   } catch {
     // React StrictMode and hot reload may evaluate this module after the policy already exists.
   }
+}
+
+export function trustedXmppXml(value: string): string {
+  const factory = (globalThis as unknown as { trustedTypes?: TrustedTypesPolicyFactoryLike }).trustedTypes;
+  if (!factory) return value;
+  if (!xmppXmlPolicy) {
+    xmppXmlPolicy = factory.createPolicy('relayless-xmpp-xml', {
+      createHTML(xml): string {
+        return xml;
+      },
+    });
+  }
+  return (xmppXmlPolicy.createHTML?.(value) ?? value) as string;
 }

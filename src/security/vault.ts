@@ -277,7 +277,10 @@ export class Vault {
 
   private async openDatabase(): Promise<IDBPDatabase> {
     if (!this.db) {
-      this.db = await openDB(DB_NAME, undefined, {
+      const databases = await indexedDB.databases();
+      const currentVersion = databases.find((database) => database.name === DB_NAME)?.version;
+      const version = currentVersion && currentVersion > 0 ? currentVersion : 1;
+      this.db = await openDB(DB_NAME, version, {
         upgrade(database) {
           if (!database.objectStoreNames.contains(STORE_NAME)) database.createObjectStore(STORE_NAME);
         },

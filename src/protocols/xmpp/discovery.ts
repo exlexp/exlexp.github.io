@@ -1,3 +1,5 @@
+import { parseSafeXmlDocument } from './xml';
+
 const WEBSOCKET_REL = 'urn:xmpp:alt-connections:websocket';
 const DEFAULT_TIMEOUT_MS = 8_000;
 
@@ -93,12 +95,10 @@ export async function discoverXmppEndpoints(
         });
         if (response.ok) {
           reachedMetadata = true;
-          const xml = new DOMParser().parseFromString(await response.text(), 'application/xml');
-          if (!xml.querySelector('parsererror')) {
-            for (const link of [...xml.getElementsByTagNameNS('*', 'Link')]) {
-              if (link.getAttribute('rel') === WEBSOCKET_REL) {
-                addEndpoint(discovered, link.getAttribute('href') ?? '', 'host-meta-xrd');
-              }
+          const xml = parseSafeXmlDocument(await response.text());
+          for (const link of [...xml.getElementsByTagNameNS('*', 'Link')]) {
+            if (link.getAttribute('rel') === WEBSOCKET_REL) {
+              addEndpoint(discovered, link.getAttribute('href') ?? '', 'host-meta-xrd');
             }
           }
         }

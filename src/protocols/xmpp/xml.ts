@@ -1,3 +1,5 @@
+import { trustedXmppXml } from '../../security/trustedTypes';
+
 const MAX_STANZA_BYTES = 256 * 1024;
 
 export function escapeXml(value: string): string {
@@ -10,14 +12,18 @@ export function escapeXml(value: string): string {
 }
 
 export function parseXmppElement(xml: string): Element {
+  return parseSafeXmlDocument(xml).documentElement;
+}
+
+export function parseSafeXmlDocument(xml: string): XMLDocument {
   if (new TextEncoder().encode(xml).byteLength > MAX_STANZA_BYTES) {
     throw new Error('XMPP stanza exceeds the 256 KiB safety limit');
   }
   if (/<!DOCTYPE|<!ENTITY/i.test(xml)) throw new Error('Unsafe XML declaration rejected');
-  const document = new DOMParser().parseFromString(xml, 'application/xml');
+  const document = new DOMParser().parseFromString(trustedXmppXml(xml), 'application/xml');
   const error = document.querySelector('parsererror');
   if (error) throw new Error('Malformed XMPP XML rejected');
-  return document.documentElement;
+  return document;
 }
 
 export function descendants(element: Element, localName: string): Element[] {
