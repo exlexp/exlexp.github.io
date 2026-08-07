@@ -75,6 +75,19 @@ describe('multi-profile model', () => {
     expect(serialized.activeProfileId).not.toBe(id);
   });
 
+  it('keeps chats and contacts when local message history is disabled', () => {
+    const data = createEmptyVault('en');
+    const profile = data.profiles[0]!;
+    data.settings.retainHistory = false;
+    profile.contacts.push({ id: 'contact', accountId: 'account', protocol: 'tox', address: 'A'.repeat(64), alias: 'Friend', presence: 'offline', remoteId: '2' });
+    profile.conversations.push({ id: 'chat', contactId: 'contact', protocol: 'tox', title: 'Friend', unread: 0, updatedAt: 1 });
+    profile.messages.push({ id: 'message', conversationId: 'chat', direction: 'outgoing', body: 'private', timestamp: 1, delivery: 'sent' });
+    const serialized = serializableVault(data);
+    expect(serialized.profiles[0]?.contacts).toHaveLength(1);
+    expect(serialized.profiles[0]?.conversations).toHaveLength(1);
+    expect(serialized.profiles[0]?.messages).toEqual([]);
+  });
+
   it('aggregates unread messages per profile', () => {
     const profile = createEmptyVault('en').profiles[0]!;
     profile.conversations.push(

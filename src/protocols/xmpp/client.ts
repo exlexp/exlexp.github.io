@@ -22,6 +22,7 @@ export type XmppEvent =
   | { type: 'message'; id: string; from: string; peer: string; body: string; timestamp: number; direction: 'incoming' | 'outgoing'; archived?: boolean }
   | { type: 'otr-wire'; id: string; from: string; peer: string; body: string; timestamp: number }
   | { type: 'encrypted-message'; id: string; from: string; timestamp: number; archived?: boolean; payload: XmppOmemoPayload }
+  | { type: 'encrypted-message-unavailable'; id: string; from: string; timestamp: number; archived?: boolean; namespace: XmppOmemoNamespace }
   | { type: 'receipt'; id: string; from: string }
   | { type: 'message-error'; id: string; from: string; detail: string }
   | { type: 'presence'; from: string; peer: string; show: string }
@@ -64,6 +65,13 @@ export class XmppIqError extends Error {
   ) {
     super(message);
     this.name = 'XmppIqError';
+  }
+}
+
+export class XmppConnectionInterruptedError extends Error {
+  constructor(message = 'XMPP connection was interrupted') {
+    super(message);
+    this.name = 'XmppConnectionInterruptedError';
   }
 }
 
@@ -124,6 +132,18 @@ export class XmppClient {
     });
   }
 
+  async withConnectionRecovery<T>(operation: () => Promise<T>, attempts = 3): Promise<T> {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      await this.waitUntilOnline(25_000);
+      try {
+        return await operation();
+      } catch (error) {
+        if (!(error instanceof XmppConnectionInterruptedError) || attempt === attempts - 1) throw error;
+      }
+    }
+    throw new XmppConnectionInterruptedError();
+  }
+
   stop(): void {
     this.stopped = true;
     if (this.reconnectTimer) window.clearTimeout(this.reconnectTimer);
@@ -143,7 +163,7 @@ export class XmppClient {
   }
 
   requestIq(innerXml: string, options: { type?: 'get' | 'set'; to?: string; timeoutMs?: number } = {}): Promise<Element> {
-    if (!this.bound || this.socket?.readyState !== WebSocket.OPEN) return Promise.reject(new Error('XMPP account is offline'));
+    if (!this.bound || this.socket?.readyState !== WebSocket.OPEN) return Promise.reject(new XmppConnectionInterruptedError());
     const id = `relayless-${crypto.randomUUID()}`;
     const to = options.to ? ` to="${escapeXml(options.to)}"` : '';
     const type = options.type ?? 'get';
@@ -163,7 +183,7 @@ export class XmppClient {
   }
 
   sendEncryptedMessage(to: string, encryptedXml: string, namespace: XmppOmemoNamespace = 'urn:xmpp:omemo:2', allowServerArchive = false): string {
-    if (!this.bound || this.socket?.readyState !== WebSocket.OPEN) throw new Error('XMPP account is offline');
+    if (!this.bound || this.socket?.readyState !== WebSocket.OPEN) throw new XmppConnectionInterruptedError();
     const id = crypto.randomUUID();
     const legacyFallback = namespace === 'eu.siacs.conversations.axolotl'
       ? '<body>[This message is OMEMO encrypted]</body>'
@@ -205,7 +225,7 @@ export class XmppClient {
   }
 
   sendMessage(to: string, body: string, allowServerArchive = false): string {
-    if (!this.bound || this.socket?.readyState !== WebSocket.OPEN) throw new Error('XMPP account is offline');
+    if (!this.bound || this.socket?.readyState !== WebSocket.OPEN) throw new XmppConnectionInterruptedError();
     if (utf8(body).byteLength > 64 * 1024) throw new Error('Message exceeds the 64 KiB safety limit');
     const id = crypto.randomUUID();
     this.send(
@@ -295,7 +315,7 @@ export class XmppClient {
       this.socket = undefined;
       this.clearHeartbeat();
       this.clearConnectionDeadline();
-      this.rejectPendingIq(new Error('XMPP connection was interrupted'));
+      this.rejectPendingIq(new XmppConnectionInterruptedError());
       if (this.activityId) networkPolicy.setState(this.activityId, 'closed');
       if (!this.stopped) { this.stream.suspend(); this.scheduleReconnect(); }
     });
@@ -492,6 +512,7 @@ export class XmppClient {
       const header = firstDescendant(encrypted, 'header');
       const payload = firstDescendant(encrypted, 'payload');
       const ownJid = bareJid(this.credentials?.jid ?? '');
+      const from = bareJid(message.getAttribute('from') ?? '');
       const namespace = encrypted.namespaceURI as XmppOmemoNamespace;
       const keyGroup = namespace === 'urn:xmpp:omemo:2'
         ? descendants(header ?? encrypted, 'keys').find((item) => bareJid(item.getAttribute('jid') ?? '') === ownJid)
@@ -502,7 +523,7 @@ export class XmppClient {
       if (payload && key && Number.isInteger(senderDeviceId) && senderDeviceId > 0) {
         const id = stableMessageId(message);
         this.emit({
-          type: 'encrypted-message', id, from: bareJid(message.getAttribute('from') ?? ''),
+          type: 'encrypted-message', id, from,
           timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(), archived,
           payload: {
             namespace, senderDeviceId,
@@ -515,6 +536,12 @@ export class XmppClient {
           },
         });
         return id;
+      }
+      if (payload && from && from !== ownJid) {
+        this.emit({
+          type: 'encrypted-message-unavailable', id: stableMessageId(message), from,
+          timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(), archived, namespace,
+        });
       }
       return undefined;
     }
@@ -560,8 +587,9 @@ export class XmppClient {
   }
 
   private send(xml: string, track = true): void {
-    if (this.socket?.readyState !== WebSocket.OPEN) throw new Error('XMPP WebSocket is not open');
-    this.socket.send(xml);
+    if (this.socket?.readyState !== WebSocket.OPEN) throw new XmppConnectionInterruptedError();
+    try { this.socket.send(xml); }
+    catch { throw new XmppConnectionInterruptedError(); }
     if (track && /^<(message|presence|iq)\b/.test(xml)) {
       this.stream.track(xml);
       if (this.stream.enabled && this.stream.pendingCount % 5 === 0) this.socket.send('<r xmlns="urn:xmpp:sm:3"/>');

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { XmppClient } from './client';
+import { XmppClient, XmppConnectionInterruptedError } from './client';
 
 describe('XMPP client contact flow', () => {
   it('adds a roster item and sends a presence subscription', () => {
@@ -123,6 +123,20 @@ describe('XMPP client contact flow', () => {
     expect(sent).toContain('<iq type="result" id="keepalive-1" to="example.org"/>');
   });
 
+  it('retries an interrupted operation after the connection recovers', async () => {
+    const client = new XmppClient();
+    let attempts = 0;
+    const harness = client as unknown as { bound: boolean; socket: { readyState: number; send(value: string): void } };
+    harness.bound = true;
+    harness.socket = { readyState: WebSocket.OPEN, send: () => undefined };
+    await expect(client.withConnectionRecovery(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new XmppConnectionInterruptedError();
+      return 'sent';
+    })).resolves.toBe('sent');
+    expect(attempts).toBe(2);
+  });
+
   it('parses Dino-compatible legacy OMEMO device notifications', async () => {
     const client = new XmppClient();
     const events: unknown[] = [];
@@ -149,6 +163,20 @@ describe('XMPP client contact flow', () => {
         namespace: 'eu.siacs.conversations.axolotl', senderDeviceId: 71, encryptedKey: 'a2V5', keyExchange: true,
         ciphertext: 'Y2lwaGVydGV4dA==', iv: 'aXY=',
       },
+    });
+  });
+
+  it('reports an incoming OMEMO message addressed only to another device', async () => {
+    const client = new XmppClient();
+    const events: unknown[] = [];
+    client.subscribe((event) => events.push(event));
+    client.setOmemoDeviceId(23);
+    const harness = client as unknown as { credentials: { jid: string }; handleFrame(xml: string): Promise<void> };
+    harness.credentials = { jid: 'me@example.org' };
+    await harness.handleFrame('<message from="friend@example.org/dino" type="chat" id="wrong-device"><encrypted xmlns="eu.siacs.conversations.axolotl"><header sid="71"><key rid="99">a2V5</key><iv>aXY=</iv></header><payload>Y2lwaGVydGV4dA==</payload></encrypted></message>');
+    expect(events).toContainEqual({
+      type: 'encrypted-message-unavailable', id: 'wrong-device', from: 'friend@example.org',
+      timestamp: expect.any(Number), archived: false, namespace: 'eu.siacs.conversations.axolotl',
     });
   });
 

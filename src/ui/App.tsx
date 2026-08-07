@@ -213,6 +213,31 @@ export function App() {
     refresh(); connectXmpp(account, profileId); setScreen('chats');
   };
 
+  const recordUnavailableOmemo = async (profileId: string, accountId: string, from: string, id: string, timestamp: number) => {
+    await vault.update((draft) => {
+      const profile = draft.profiles.find((item) => item.id === profileId); if (!profile) return;
+      if (profile.messages.some((item) => item.id === id)) return;
+      let contact = profile.contacts.find((item) => item.accountId === accountId && item.address === from);
+      if (!contact) {
+        contact = { id: crypto.randomUUID(), accountId, protocol: 'xmpp', address: from, alias: from, presence: 'offline' };
+        profile.contacts.push(contact);
+      }
+      const conversation = ensureConversation(profile, contact.id, timestamp);
+      const visible = viewState.current.activeProfileId === profileId && viewState.current.screen === 'chats' && viewState.current.conversationId === conversation.id;
+      recordIncomingActivity(conversation, visible, timestamp);
+      conversation.encryption = {
+        policy: conversation.encryption?.policy ?? 'secure-auto', provider: 'omemo', verified: false,
+        devices: conversation.encryption?.devices ?? [], warning: 'unavailable',
+      };
+      profile.messages.push({
+        id, conversationId: conversation.id, direction: 'incoming',
+        body: languageHint(t, 'Получено OMEMO-сообщение, но оно не было зашифровано для этого устройства.', 'An OMEMO message arrived, but it was not encrypted for this device.'),
+        timestamp, delivery: 'delivered', sourceAccountId: accountId, encryptionProvider: 'omemo',
+      });
+    });
+    refresh();
+  };
+
   const connectXmpp = (account: Account, profileId = data.activeProfileId) => {
     if (!account.endpoint || !account.secret) return;
     const key = `${profileId}:${account.id}`;
@@ -335,8 +360,14 @@ export function App() {
             });
             refresh();
             if (shouldNotify) showLocalMessageNotification(profileName, conversationTitle, decrypted.body, vault.snapshot.settings.showNotificationPreviews);
-          } catch (reason) { setError(redactError(reason)); }
+          } catch {
+            await recordUnavailableOmemo(profileId, account.id, event.from, event.id, event.timestamp);
+            setError(languageHint(t, 'OMEMO-сообщение получено, но расшифровать его не удалось.', 'An OMEMO message arrived but could not be decrypted.'));
+          }
         })();
+      }
+      if (event.type === 'encrypted-message-unavailable') {
+        void recordUnavailableOmemo(profileId, account.id, event.from, event.id, event.timestamp);
       }
       if (event.type === 'receipt') {
         void vault.update((draft) => { const message = draft.profiles.find((profile) => profile.id === profileId)?.messages.find((item) => item.id === event.id); if (message) message.delivery = 'delivered'; }).then(refresh);
@@ -360,7 +391,7 @@ export function App() {
       // A second client can overwrite a PEP device list while this browser is
       // disconnected. Re-announce both modern and Dino-compatible legacy
       // bundles after every successful stream recovery.
-      await existing.announce();
+      await client.withConnectionRecovery(() => existing.announce());
       return existing;
     }
     const pending = omemoInitializations.current.get(key);
@@ -375,7 +406,7 @@ export function App() {
         });
       });
       omemoEngines.current.set(key, engine);
-      try { await engine.announce(); }
+      try { await client.withConnectionRecovery(() => engine.announce()); }
       catch (reason) {
         omemoEngines.current.delete(key);
         client.setOmemoDeviceId(undefined);
@@ -591,6 +622,10 @@ export function App() {
       if (event.type === 'ready') {
         current.address = event.address; current.savedata = event.savedata;
         reconcileToxFriends(profile, accountId, event.friends);
+        for (const friend of event.friends) {
+          const contact = resolveToxContact(profile, accountId, friend.friendNumber, friend.publicKey, true);
+          if (contact) ensureConversation(profile, contact.id, Date.now());
+        }
       }
       if (event.type === 'savedata') current.savedata = event.savedata;
       if (event.type === 'transport' && event.transport === 'tcp') {
@@ -752,39 +787,43 @@ export function App() {
       } else {
         const client = xmppClients.current.get(`${profileId}:${sourceAccountId}`);
         if (!client) throw new Error(languageHint(t, 'Сначала подключите XMPP-аккаунт.', 'Connect the XMPP account first.'));
-        await client.waitUntilOnline(25_000);
-        if (provider === 'omemo') {
-          const engine = omemoEngines.current.get(`${profileId}:${sourceAccountId}`);
-          if (!engine) throw new Error('OMEMO is not ready; message was not sent');
-          const encrypted = await engine.encrypt(contact.address, body);
-          sentId = client.sendEncryptedMessage(contact.address, encrypted.xml, encrypted.namespace, Boolean(source.mamEnabled));
-          await vault.update((draft) => {
-            const current = draft.profiles.find((item) => item.id === profileId)?.conversations.find((item) => item.id === conversation.id);
-            if (!current) return;
-            const previous = current.encryption?.devices ?? [];
-            const recipientDevices = encrypted.devices.filter((item) => item.jid === contact.address.split('/')[0]);
-            const devices = recipientDevices.map((item) => ({
-                id: `${item.jid}:${item.deviceId}`, label: `XMPP ${item.deviceId}`, fingerprint: item.fingerprint,
-                trust: previous.find((known) => known.fingerprint === item.fingerprint)?.trust ?? 'untrusted', firstSeenAt: Date.now(),
-              }));
-            const verified = devices.length > 0 && devices.every((item) => item.trust === 'trusted');
-            current.encryption = {
-              policy: current.encryption?.policy ?? 'secure-auto', provider: 'omemo', verified,
-              devices,
-              warning: encrypted.skippedDevices.some((item) => item.jid === contact.address.split('/')[0])
-                ? 'stale-device'
-                : verified ? undefined : 'first-use',
-              skippedDevices: encrypted.skippedDevices.filter((item) => item.jid === contact.address.split('/')[0]).length || undefined,
-            };
-          });
-        } else if (provider === 'otr') {
-          if (!contact.resource) throw new Error(languageHint(t, 'OTR требует, чтобы конкретное устройство контакта было в сети.', 'OTR requires a specific contact device to be online.'));
-          const manager = otrManagers.current.get(`${profileId}:${sourceAccountId}`);
-          if (!manager) throw new Error('OTR is not ready; message was not sent');
-          await manager.send(contact.resource, body, pendingId);
-          sentId = pendingId;
-          deferredOtr = true;
-        } else sentId = client.sendMessage(contact.address, body, Boolean(source.mamEnabled));
+        sentId = await client.withConnectionRecovery(async () => {
+          if (provider === 'omemo') {
+            const engine = omemoEngines.current.get(`${profileId}:${sourceAccountId}`);
+            if (!engine) throw new Error('OMEMO is not ready; message was not sent');
+            const encrypted = await engine.encrypt(contact.address, body);
+            const messageId = client.sendEncryptedMessage(contact.address, encrypted.xml, encrypted.namespace, Boolean(source.mamEnabled));
+            await vault.update((draft) => {
+              const current = draft.profiles.find((item) => item.id === profileId)?.conversations.find((item) => item.id === conversation.id);
+              if (!current) return;
+              const previous = current.encryption?.devices ?? [];
+              const recipientDevices = encrypted.devices.filter((item) => item.jid === contact.address.split('/')[0]);
+              const devices = recipientDevices.map((item) => ({
+                  id: `${item.jid}:${item.deviceId}`, label: `XMPP ${item.deviceId}`, fingerprint: item.fingerprint,
+                  trust: previous.find((known) => known.fingerprint === item.fingerprint)?.trust ?? 'untrusted', firstSeenAt: Date.now(),
+                }));
+              const verified = devices.length > 0 && devices.every((item) => item.trust === 'trusted');
+              current.encryption = {
+                policy: current.encryption?.policy ?? 'secure-auto', provider: 'omemo', verified,
+                devices,
+                warning: encrypted.skippedDevices.some((item) => item.jid === contact.address.split('/')[0])
+                  ? 'stale-device'
+                  : verified ? undefined : 'first-use',
+                skippedDevices: encrypted.skippedDevices.filter((item) => item.jid === contact.address.split('/')[0]).length || undefined,
+              };
+            });
+            return messageId;
+          }
+          if (provider === 'otr') {
+            if (!contact.resource) throw new Error(languageHint(t, 'OTR требует, чтобы конкретное устройство контакта было в сети.', 'OTR requires a specific contact device to be online.'));
+            const manager = otrManagers.current.get(`${profileId}:${sourceAccountId}`);
+            if (!manager) throw new Error('OTR is not ready; message was not sent');
+            await manager.send(contact.resource, body, pendingId);
+            deferredOtr = true;
+            return pendingId;
+          }
+          return client.sendMessage(contact.address, body, Boolean(source.mamEnabled));
+        });
       }
       if (!deferredOtr) await vault.update((draft) => {
         const message = draft.profiles.find((item) => item.id === profileId)?.messages.find((item) => item.id === pendingId);
