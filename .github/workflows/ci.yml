@@ -8,18 +8,22 @@ jobs:
   tox-wasm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Emscripten
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build build-essential autoconf automake libtool pkg-config python3 curl xz-utils
-          sudo git clone --depth 1 --branch 4.0.3 https://github.com/emscripten-core/emsdk.git /opt/emsdk
+          sudo mkdir -p /opt/emsdk
           sudo chown -R "$USER" /opt/emsdk
           cd /opt/emsdk
+          git init
+          git remote add origin https://github.com/emscripten-core/emsdk.git
+          git fetch --depth 1 origin 127ce42cd5f0aabe2d9b5d636041ccef7c66d165
+          git checkout --detach 127ce42cd5f0aabe2d9b5d636041ccef7c66d165
           ./emsdk install 4.0.3
           ./emsdk activate 4.0.3
       - run: sh scripts/build-tox-wasm-wsl.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: tox-wasm
           path: |
@@ -28,16 +32,16 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: npm ci --ignore-scripts --no-audit
       - run: npm run verify
       - run: npm run bundle:iwa
       - run: npm run checksums
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: unsigned-iwa
           path: |

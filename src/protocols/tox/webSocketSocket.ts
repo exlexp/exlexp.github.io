@@ -1,4 +1,5 @@
 import type { ToxSocketFactories } from './socketBridge';
+import { privateWebSocket } from '../../network/privateTransport';
 
 const OPEN_TIMEOUT_MS = 8_000;
 const MAX_BUFFERED_BYTES = 1024 * 1024;
@@ -78,7 +79,7 @@ export class GatewayTcpSocket {
 
 function openWebSocket(url: string): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url);
+    const socket = privateWebSocket(url, undefined, 'tox-gateway');
     socket.binaryType = 'arraybuffer';
     const timer = setTimeout(() => fail(new Error('Tox gateway timed out')), OPEN_TIMEOUT_MS);
     const cleanup = () => {

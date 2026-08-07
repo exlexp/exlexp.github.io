@@ -65,7 +65,7 @@ export default {
     return new Response(null, {
       status: 101,
       webSocket: client,
-      headers: { 'X-Relayless-Protocol': 'tox-tcp-v1' },
+      headers: privacyHeaders({ 'X-Relayless-Protocol': 'tox-tcp-v1' }),
     });
   },
 };
@@ -160,7 +160,16 @@ async function pseudonymousConnectionKey(address: string): Promise<string> {
 }
 
 function json(value: unknown, status = 200): Response {
-  return Response.json(value, { status, headers: { 'Cache-Control': 'no-store' } });
+  return Response.json(value, { status, headers: privacyHeaders() });
+}
+
+function privacyHeaders(extra: Record<string, string> = {}): Headers {
+  return new Headers({
+    'Cache-Control': 'no-store, max-age=0',
+    'Referrer-Policy': 'no-referrer',
+    'X-Content-Type-Options': 'nosniff',
+    ...extra,
+  });
 }
 
 function withTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {

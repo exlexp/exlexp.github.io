@@ -9,7 +9,7 @@
   },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "build": "tsc -b && vite build",
+    "build": "npm run verify:tox-assets && tsc -b && vite build",
     "typecheck": "tsc -b --pretty false",
     "lint": "eslint . --max-warnings 0",
     "test": "vitest run",
@@ -19,6 +19,7 @@
     "gateway:dev:worker": "wrangler dev --config gateway/wrangler.jsonc --port 8787",
     "gateway:deploy": "wrangler deploy --config gateway/wrangler.jsonc",
     "privacy:audit": "node scripts/privacy-audit.mjs",
+    "verify:tox-assets": "node scripts/verify-tox-assets.mjs",
     "build:tox": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-tox-wasm.ps1",
     "key:development": "node scripts/generate-development-key.mjs",
     "bundle:iwa": "npm run build && wbn --dir dist --output dist/relayless.wbn",

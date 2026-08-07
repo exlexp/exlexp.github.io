@@ -49,7 +49,7 @@ export function xmppDomainFromJid(jid: string): string {
 
 export async function discoverXmppEndpoints(
   domainInput: string,
-  fetcher: typeof fetch = fetch,
+  fetcher: typeof fetch = globalThis.fetch,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<XmppDiscoveryResult> {
   const domain = normalizeXmppDomain(domainInput);
@@ -68,13 +68,13 @@ export async function discoverXmppEndpoints(
 
   try {
     try {
-      const response = await fetcher(`https://${domain}/.well-known/host-meta.json`, {
+      const response = await privateFetch(`https://${domain}/.well-known/host-meta.json`, {
         credentials: 'omit',
         redirect: 'follow',
         referrerPolicy: 'no-referrer',
         signal: controller.signal,
         headers: { Accept: 'application/jrd+json, application/json' },
-      });
+      }, 'xmpp-discovery', fetcher);
       if (response.ok) {
         reachedMetadata = true;
         const document = await response.json() as { links?: Array<{ rel?: string; href?: string }> };
@@ -86,13 +86,13 @@ export async function discoverXmppEndpoints(
 
     if (discovered.length === 0) {
       try {
-        const response = await fetcher(`https://${domain}/.well-known/host-meta`, {
+        const response = await privateFetch(`https://${domain}/.well-known/host-meta`, {
           credentials: 'omit',
           redirect: 'follow',
           referrerPolicy: 'no-referrer',
           signal: controller.signal,
           headers: { Accept: 'application/xrd+xml, application/xml, text/xml' },
-        });
+        }, 'xmpp-discovery', fetcher);
         if (response.ok) {
           reachedMetadata = true;
           const xml = parseSafeXmlDocument(await response.text());
@@ -124,3 +124,4 @@ function addEndpoint(target: DiscoveredXmppEndpoint[], href: string, source: Xmp
     if (!target.some((item) => item.url === normalized)) target.push({ url: normalized, source });
   } catch { /* Invalid advertisements are ignored. */ }
 }
+import { privateFetch } from '../../network/privateTransport';

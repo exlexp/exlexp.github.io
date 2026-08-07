@@ -4,14 +4,10 @@ import { extname, join, relative } from 'node:path';
 const root = new URL('..', import.meta.url).pathname.replace(/^\/(.:)/, '$1');
 const forbiddenPackages = ['@sentry/', 'posthog', 'firebase', '@supabase/', 'google-analytics', 'mixpanel', 'segment'];
 const forbiddenTokens = ['google-analytics.com', 'googletagmanager.com', 'sentry.io', 'api.segment.io', 'app.posthog.com'];
-const scannedExtensions = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.html', '.json', '.webmanifest']);
+const scannedExtensions = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.html', '.json', '.webmanifest', '.yml', '.yaml']);
 const allowedClientNetworkFiles = new Set([
-  'src/protocols/tox/client.ts',
+  'src/network/privateTransport.ts',
   'src/protocols/tox/tox.worker.ts',
-  'src/protocols/tox/webSocketSocket.ts',
-  'src/protocols/xmpp/client.ts',
-  'src/protocols/xmpp/discovery.ts',
-  'src/protocols/xmpp/registration.ts',
 ]);
 const directNetworkPatterns = [/\bfetch\s*\(/, /\bnew\s+WebSocket\s*\(/, /navigator\.sendBeacon\s*\(/, /\bnew\s+EventSource\s*\(/, /\bXMLHttpRequest\s*\(/];
 const forbiddenBrowserStoragePatterns = [/\blocalStorage\b/, /\bsessionStorage\b/, /document\.cookie\b/];
@@ -35,6 +31,10 @@ async function walk(directory) {
             if (pattern.test(text)) findings.push(`${repositoryPath}: undeclared network primitive ${pattern}`);
           }
         }
+      }
+      if (repositoryPath.startsWith('.github/workflows/')) {
+        if (/\buses:\s*[^\s]+@(?![a-f0-9]{40}\b)[^\s#]+/i.test(text)) findings.push(`${repositoryPath}: GitHub Action is not pinned to a full commit SHA`);
+        if (/\bnpm ci\s*(?:\r?\n|$)/.test(text) || /\bnpm ci(?![^\r\n]*--ignore-scripts)/.test(text)) findings.push(`${repositoryPath}: npm ci must disable dependency lifecycle scripts`);
       }
     }
   }

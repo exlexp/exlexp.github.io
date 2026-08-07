@@ -1,4 +1,5 @@
 import { networkPolicy } from '../../network/policy';
+import { privateWebSocket } from '../../network/privateTransport';
 import { bytesToBase64, utf8 } from '../../security/encoding';
 import { redactError } from '../../security/redaction';
 import { createScramSession, decodeSasl, encodeSasl, verifyServerFinal, type ScramSession } from './scram';
@@ -122,7 +123,7 @@ export class XmppClient {
     });
   }
 
-  sendEncryptedMessage(to: string, encryptedXml: string, namespace: XmppOmemoNamespace = 'urn:xmpp:omemo:2'): string {
+  sendEncryptedMessage(to: string, encryptedXml: string, namespace: XmppOmemoNamespace = 'urn:xmpp:omemo:2', allowServerArchive = false): string {
     if (!this.bound || this.socket?.readyState !== WebSocket.OPEN) throw new Error('XMPP account is offline');
     const id = crypto.randomUUID();
     const legacyFallback = namespace === 'eu.siacs.conversations.axolotl'
@@ -134,7 +135,7 @@ export class XmppClient {
         legacyFallback +
         `<encryption xmlns="urn:xmpp:eme:0" namespace="${namespace}"/>` +
         `<origin-id xmlns="urn:xmpp:sid:0" id="${id}"/>` +
-        `<store xmlns="urn:xmpp:hints"/>` +
+        archiveHint(allowServerArchive) +
         `<request xmlns="urn:xmpp:receipts"/>` +
       `</message>`,
     );
@@ -164,7 +165,7 @@ export class XmppClient {
     this.send(`<message to="${escapeXml(to)}"><received xmlns="urn:xmpp:receipts" id="${escapeXml(id)}"/></message>`);
   }
 
-  sendMessage(to: string, body: string): string {
+  sendMessage(to: string, body: string, allowServerArchive = false): string {
     if (!this.bound || this.socket?.readyState !== WebSocket.OPEN) throw new Error('XMPP account is offline');
     if (utf8(body).byteLength > 64 * 1024) throw new Error('Message exceeds the 64 KiB safety limit');
     const id = crypto.randomUUID();
@@ -172,9 +173,8 @@ export class XmppClient {
       `<message to="${escapeXml(to)}" type="chat" id="${id}">` +
         `<body>${escapeXml(body)}</body>` +
         `<origin-id xmlns="urn:xmpp:sid:0" id="${id}"/>` +
-        `<active xmlns="http://jabber.org/protocol/chatstates"/>` +
         `<request xmlns="urn:xmpp:receipts"/>` +
-        `<store xmlns="urn:xmpp:hints"/>` +
+        archiveHint(allowServerArchive) +
       `</message>`,
     );
     return id;
@@ -224,7 +224,7 @@ export class XmppClient {
       source: 'user',
     });
     try {
-      this.socket = new WebSocket(endpoint, 'xmpp');
+      this.socket = privateWebSocket(endpoint, 'xmpp', 'xmpp-provider');
     } catch (error) {
       this.fail(redactError(error));
       return;
@@ -532,6 +532,12 @@ export class XmppClient {
     }
     this.pendingIq.clear();
   }
+}
+
+function archiveHint(allowServerArchive: boolean): string {
+  return allowServerArchive
+    ? '<store xmlns="urn:xmpp:hints"/>'
+    : '<no-permanent-store xmlns="urn:xmpp:hints"/>';
 }
 
 function parseJid(jid: string): { local: string; domain: string } {

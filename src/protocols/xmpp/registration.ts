@@ -1,4 +1,5 @@
 import { networkPolicy } from '../../network/policy';
+import { privateWebSocket } from '../../network/privateTransport';
 import { escapeXml, firstDescendant, parseXmppElement } from './xml';
 import { normalizeXmppDomain } from './discovery';
 
@@ -102,7 +103,7 @@ export class XmppRegistrationClient {
       if (!this.target) { reject(new Error('XMPP registration target is missing')); return; }
       let featuresSeen = false;
       const timer = window.setTimeout(() => reject(new XmppRegistrationError('timeout', 'Сервер не ответил вовремя')), 15_000);
-      try { this.socket = new WebSocket(this.target.endpoint, 'xmpp'); }
+      try { this.socket = privateWebSocket(this.target.endpoint, 'xmpp', 'xmpp-provider'); }
       catch (error) { window.clearTimeout(timer); reject(error); return; }
       this.socket.addEventListener('open', () => {
         if (this.activityId) networkPolicy.setState(this.activityId, 'open');
@@ -306,4 +307,3 @@ function safeImageMime(value: string): boolean {
 function humanizeField(value: string): string {
   return value.replaceAll('_', ' ').replaceAll('-', ' ').replace(/^./, (letter) => letter.toUpperCase());
 }
-

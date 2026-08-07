@@ -112,4 +112,5 @@ emcc "$ROOT/native/tox-wasm/relayless_tox_bridge.c" \
 
 test -s "$ROOT/public/tox/toxcore.mjs"
 test -s "$ROOT/public/tox/toxcore.wasm"
+(cd "$ROOT/public/tox" && sha256sum toxcore.mjs toxcore.wasm > SHA256SUMS)
 ls -lh "$ROOT/public/tox/toxcore.mjs" "$ROOT/public/tox/toxcore.wasm"

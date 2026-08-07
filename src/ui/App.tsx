@@ -752,7 +752,7 @@ export function App() {
           const engine = omemoEngines.current.get(`${profileId}:${sourceAccountId}`);
           if (!engine) throw new Error('OMEMO is not ready; message was not sent');
           const encrypted = await engine.encrypt(contact.address, body);
-          sentId = client.sendEncryptedMessage(contact.address, encrypted.xml, encrypted.namespace);
+          sentId = client.sendEncryptedMessage(contact.address, encrypted.xml, encrypted.namespace, Boolean(source.mamEnabled));
           await vault.update((draft) => {
             const current = draft.profiles.find((item) => item.id === profileId)?.conversations.find((item) => item.id === conversation.id);
             if (!current) return;
@@ -779,7 +779,7 @@ export function App() {
           await manager.send(contact.resource, body, pendingId);
           sentId = pendingId;
           deferredOtr = true;
-        } else sentId = client.sendMessage(contact.address, body);
+        } else sentId = client.sendMessage(contact.address, body, Boolean(source.mamEnabled));
       }
       if (!deferredOtr) await vault.update((draft) => {
         const message = draft.profiles.find((item) => item.id === profileId)?.messages.find((item) => item.id === pendingId);

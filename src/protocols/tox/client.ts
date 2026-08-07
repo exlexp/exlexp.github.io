@@ -1,5 +1,6 @@
 import type { ToxBootstrapNode, ToxCommand, ToxEvent, ToxWorkerRequest, ToxWorkerResponse } from './types';
 import { toxGatewayUrls } from './gatewayConfig';
+import { privateFetch } from '../../network/privateTransport';
 
 type Listener = (event: ToxEvent) => void;
 
@@ -25,7 +26,7 @@ export class ToxClient {
   }
 
   async start(options: { savedata?: string; name: string; status?: string }): Promise<void> {
-    const response = await fetch(`${import.meta.env.BASE_URL}tox-bootstrap-nodes.json`, { cache: 'no-store', credentials: 'same-origin' });
+    const response = await privateFetch(`${import.meta.env.BASE_URL}tox-bootstrap-nodes.json`, { cache: 'no-store' }, 'bundled-asset');
     if (!response.ok) throw new Error('Bundled Tox bootstrap list is unavailable');
     const document = await response.json() as BootstrapDocument;
     validateNodes(document.nodes);

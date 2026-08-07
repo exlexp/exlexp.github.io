@@ -51,6 +51,20 @@ describe('vault persistence', () => {
     expect(vault.snapshot.profiles[0]?.messages).toHaveLength(1);
   });
 
+  it('keeps messages available for the session but never persists them when history is disabled', async () => {
+    await vault.create('a sufficiently long password', 'en', { iterations: 1, memoryKiB: 64, parallelism: 1 });
+    await vault.update((draft) => {
+      draft.settings.retainHistory = false;
+      draft.profiles[0]!.messages.push({ id: 'm', conversationId: 'c', direction: 'incoming', body: 'session only', timestamp: 1, delivery: 'delivered' });
+      draft.profiles[0]!.drafts.c = 'private draft';
+    });
+    expect(vault.snapshot.profiles[0]!.messages).toHaveLength(1);
+    vault.lock();
+    await vault.unlock('a sufficiently long password');
+    expect(vault.snapshot.profiles[0]!.messages).toHaveLength(0);
+    expect(vault.snapshot.profiles[0]!.drafts).toEqual({});
+  });
+
   it('serializes simultaneous updates without losing data', async () => {
     vault.createEphemeral('en');
     await Promise.all(Array.from({ length: 20 }, (_, index) => vault.update((draft) => {

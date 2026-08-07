@@ -150,6 +150,12 @@ export function aggregateUnread(profile: LocalProfile): number {
 export function serializableVault(data: VaultData): VaultData {
   const copy = structuredClone(data);
   copy.profiles = copy.profiles.filter((profile) => !profile.ephemeral);
+  if (!copy.settings.retainHistory) {
+    for (const profile of copy.profiles) {
+      profile.messages = [];
+      profile.drafts = {};
+    }
+  }
   if (copy.profiles.length === 0) {
     const fallback = createLocalProfile(copy.settings.language === 'ru' ? 'Личный' : 'Personal', 0);
     copy.profiles.push(fallback);

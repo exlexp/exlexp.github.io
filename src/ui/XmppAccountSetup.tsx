@@ -140,7 +140,7 @@ export function XmppAccountSetup({ addXmpp, t }: Props) {
           <details className="connection-advanced" open={!signin.endpoint}>
             <summary>{ru ? 'Адрес подключения' : 'Connection address'}</summary>
             <label>{ru ? 'Защищённый WebSocket' : 'Secure WebSocket'}<input type="url" pattern="wss://.*" value={signin.endpoint} onChange={(event) => setSignin({ ...signin, endpoint: event.target.value })} placeholder="wss://example.org/xmpp-websocket" required/></label>
-            <label className="registration-check"><input type="checkbox" checked={signin.mamEnabled} onChange={(event) => setSignin({ ...signin, mamEnabled: event.target.checked })}/><span>{ru ? 'Загрузить до 100 сообщений за последние 7 дней' : 'Load up to 100 messages from the last 7 days'}</span></label>
+            <label className="registration-check"><input type="checkbox" checked={signin.mamEnabled} onChange={(event) => setSignin({ ...signin, mamEnabled: event.target.checked })}/><span>{ru ? 'Разрешить серверный архив и загрузить до 100 сообщений за 7 дней' : 'Allow server archive and load up to 100 messages from 7 days'}</span></label>
           </details>
           {error && <p className="inline-error" role="alert">{error}</p>}
           <button className="primary" type="submit">{ru ? 'Сохранить и подключить' : 'Save and connect'}</button>

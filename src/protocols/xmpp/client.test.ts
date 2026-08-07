@@ -22,7 +22,7 @@ describe('XMPP client contact flow', () => {
     expect(() => client.addContact('missing-domain')).toThrow(/complete contact JID/i);
   });
 
-  it('sends reliable TLS chat stanzas with receipts and offline storage', () => {
+  it('keeps offline delivery while declining permanent server archives by default', () => {
     const sent: string[] = [];
     const client = new XmppClient();
     const harness = client as unknown as { bound: boolean; socket: { readyState: number; send(value: string): void } };
@@ -33,8 +33,20 @@ describe('XMPP client contact flow', () => {
     expect(sent[0]).toContain('<body>hello &amp; goodbye</body>');
     expect(sent[0]).toContain('urn:xmpp:receipts');
     expect(sent[0]).toContain('urn:xmpp:hints');
+    expect(sent[0]).toContain('<no-permanent-store');
+    expect(sent[0]).not.toContain('<store');
+    expect(sent[0]).not.toContain('chatstates');
+  });
+
+  it('requests server archiving only after explicit consent', () => {
+    const sent: string[] = [];
+    const client = new XmppClient();
+    const harness = client as unknown as { bound: boolean; socket: { readyState: number; send(value: string): void } };
+    harness.bound = true;
+    harness.socket = { readyState: WebSocket.OPEN, send: (value) => sent.push(value) };
+    client.sendMessage('friend@example.org', 'archived', true);
     expect(sent[0]).toContain('<store');
-    expect(sent[0]).not.toContain('no-store');
+    expect(sent[0]).not.toContain('no-permanent-store');
   });
 
   it('routes OTR only to a full JID and disables server-side copies', () => {
@@ -76,6 +88,7 @@ describe('XMPP client contact flow', () => {
     expect(sent[0]).toContain('xmlns="urn:xmpp:eme:0"');
     expect(sent[0]).toContain('namespace="urn:xmpp:omemo:2"');
     expect(sent[0]).not.toContain('<body>');
+    expect(sent[0]).toContain('<no-permanent-store');
   });
 
   it('adds the fixed compatibility body used by Dino for legacy OMEMO', () => {

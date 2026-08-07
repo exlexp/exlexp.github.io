@@ -14,7 +14,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: npm ci --ignore-scripts --no-audit
       - run: npm run verify
       - run: npm run bundle:iwa
       - run: npm run checksums
