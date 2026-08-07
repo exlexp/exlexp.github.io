@@ -1,8 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DirectTcpConnection, DirectUdpConnection } from './directSockets';
+import { DirectTcpConnection, DirectUdpConnection, hasDirectSockets } from './directSockets';
 
 describe('Direct Sockets adapters', () => {
   afterEach(() => { Reflect.deleteProperty(globalThis, 'TCPSocket'); Reflect.deleteProperty(globalThis, 'UDPSocket'); });
+
+  it('reports whether both socket APIs are available', () => {
+    expect(hasDirectSockets()).toBe(false);
+    Object.defineProperty(globalThis, 'TCPSocket', { value: class {}, configurable: true });
+    expect(hasDirectSockets()).toBe(false);
+    Object.defineProperty(globalThis, 'UDPSocket', { value: class {}, configurable: true });
+    expect(hasDirectSockets()).toBe(true);
+  });
 
   it('refuses normal browser environments', async () => {
     await expect(new DirectTcpConnection().connect('127.0.0.1', 33445, 'tox-relay')).rejects.toThrow(/installed IWA/i);
