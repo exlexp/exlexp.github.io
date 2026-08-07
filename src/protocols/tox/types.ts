@@ -6,7 +6,7 @@ export interface ToxBootstrapNode {
   enabled: boolean;
 }
 
-export type ToxState = 'offline' | 'starting' | 'connecting' | 'online' | 'error';
+export type ToxState = 'offline' | 'starting' | 'connecting' | 'reconnecting' | 'online' | 'error';
 
 export type ToxEvent =
   | { type: 'state'; state: ToxState; detail?: string }
@@ -15,7 +15,8 @@ export type ToxEvent =
   | { type: 'friend-request'; publicKey: string; message: string }
   | { type: 'friend-connection'; friendNumber: number; online: boolean }
   | { type: 'message'; friendNumber: number; text: string; timestamp: number }
-  | { type: 'receipt'; friendNumber: number; messageId: number };
+  | { type: 'receipt'; friendNumber: number; messageId: number }
+  | { type: 'transport'; transport: 'udp' | 'tcp'; state: 'created' | 'opening' | 'open' | 'closed' | 'error'; host?: string; port?: number };
 
 export interface ToxFriend {
   friendNumber: number;
@@ -23,7 +24,7 @@ export interface ToxFriend {
 }
 
 export type ToxCommand =
-  | { type: 'start'; savedata?: string; name: string; status: string; nodes: ToxBootstrapNode[] }
+  | { type: 'start'; savedata?: string; name: string; status: string; nodes: ToxBootstrapNode[]; gatewayUrls: string[] }
   | { type: 'stop' }
   | { type: 'snapshot' }
   | { type: 'set-profile'; name: string; status: string }

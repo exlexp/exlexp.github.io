@@ -4,10 +4,10 @@ import { activeProfile, createProfile, deleteProfile, duplicateProfileSettings, 
 import { conversationMatchesQuery, ensureConversation, recordIncomingActivity } from '../models/conversations';
 import { requireSourceIdentity, switchProfileState } from '../models/profileRuntime';
 import type { Account, Conversation, LocalProfile, Message, PluginPermission, ProfileSettings, VaultData } from '../models/types';
-import { hasDirectSockets } from '../network/directSockets';
 import { networkPolicy, type NetworkActivity } from '../network/policy';
 import { XmppClient } from '../protocols/xmpp/client';
 import { ToxClient } from '../protocols/tox/client';
+import { hasToxTransport } from '../protocols/tox/gatewayConfig';
 import type { ToxEvent } from '../protocols/tox/types';
 import { availablePluginCommands, installPlugin, parsePluginManifest } from '../plugins/host';
 import { redactError } from '../security/redaction';
@@ -254,8 +254,8 @@ export function App() {
 
   const connectTox = async (account: Account, profileId = data.activeProfileId): Promise<ToxClient> => {
     const key = `${profileId}:${account.id}`;
-    const directSockets = hasDirectSockets();
-    const unavailableDetail = languageHint(t, 'Tox подключается только в установленном приложении.', 'Tox connects only in the installed app.');
+    const transportAvailable = hasToxTransport();
+    const unavailableDetail = languageHint(t, 'Шлюз Tox временно недоступен.', 'The Tox gateway is temporarily unavailable.');
     const markUnavailable = async () => {
       await vault.update((draft) => {
         const current = draft.profiles.find((item) => item.id === profileId)?.accounts.find((item) => item.id === account.id);
@@ -267,7 +267,7 @@ export function App() {
       refresh();
     };
     const existing = toxClients.current.get(key);
-    if (!directSockets && account.address) {
+    if (!transportAvailable && account.address) {
       if (existing) { await existing.stop().catch(() => undefined); toxClients.current.delete(key); }
       await markUnavailable();
       throw new Error(unavailableDetail);
@@ -292,12 +292,6 @@ export function App() {
       });
       refresh(); setError(detail);
       throw reason;
-    }
-    if (!directSockets) {
-      toxClients.current.delete(key);
-      await client.stop();
-      await markUnavailable();
-      throw new Error(unavailableDetail);
     }
     return client;
   };
@@ -348,6 +342,10 @@ export function App() {
         }
       }
       if (event.type === 'savedata') current.savedata = event.savedata;
+      if (event.type === 'transport' && event.transport === 'tcp') {
+        if (event.state === 'open') current.connectionDetail = languageHint(t, 'TCP-релей Tox подключён.', 'Tox TCP relay connected.');
+        if (event.state === 'error') current.connectionDetail = languageHint(t, 'Переключаем Tox-релей…', 'Switching Tox relay…');
+      }
       if (event.type === 'friend-request' && !profile.friendRequests.some((item) => item.accountId === accountId && item.publicKey === event.publicKey)) {
         profile.friendRequests.push({ id: crypto.randomUUID(), accountId, protocol: 'tox', publicKey: event.publicKey, message: event.message, receivedAt: Date.now() });
       }
@@ -612,7 +610,7 @@ function Accounts({ profile, addXmpp, connectXmpp, addTox, connectTox, disconnec
   const [kind, setKind] = useState<'xmpp' | 'tox'>('xmpp');
   const [toxAlias, setToxAlias] = useState('Tox');
   const [toxImport, setToxImport] = useState('');
-  const directSockets = hasDirectSockets();
+  const toxAvailable = hasToxTransport();
   return (
     <div className="content-grid">
       <section>
@@ -621,11 +619,11 @@ function Accounts({ profile, addXmpp, connectXmpp, addTox, connectTox, disconnec
           {profile.accounts.map((account) => (
             <div className="account-row" key={account.id}>
               <span className={`chat-avatar protocol-account ${account.protocol}`}>{account.protocol === 'xmpp' ? <XmppIcon/> : <ToxIcon/>}</span>
-              <div><strong>{account.alias}</strong><small>{account.address}</small>{account.protocol === 'tox' && !directSockets && <small className="connection-note">{languageHint(t, 'В браузере доступен профиль, подключение — в приложении.', 'The profile is available here; connect from the installed app.')}</small>}</div>
-              <span className={`state ${account.protocol === 'tox' && !directSockets ? 'error' : account.connectionState ?? account.presence}`} title={account.connectionDetail}>{accountConnectionLabel(account, t)}</span>
+              <div><strong>{account.alias}</strong><small>{account.address}</small>{account.protocol === 'tox' && toxAvailable && <small className="connection-note">{languageHint(t, 'Защищённое подключение через Tox TCP.', 'Secure connection through Tox TCP.')}</small>}</div>
+              <span className={`state ${account.protocol === 'tox' && !toxAvailable ? 'error' : account.connectionState ?? account.presence}`} title={account.connectionDetail}>{accountConnectionLabel(account, t)}</span>
               <div className="account-actions">
                 {account.address && <button className="icon-text" onClick={() => void navigator.clipboard.writeText(account.address)}>{languageHint(t, 'Копировать', 'Copy')}</button>}
-                <button className="secondary compact" disabled={account.protocol === 'tox' && !directSockets} title={account.protocol === 'tox' && !directSockets ? languageHint(t, 'Для сети Tox откройте установленное приложение.', 'Open the installed app to use the Tox network.') : undefined} onClick={() => accountConnectionRunning(account) ? void disconnectAccount(account) : account.protocol === 'xmpp' ? connectXmpp(account) : void connectTox(account).catch(() => undefined)}>{account.protocol === 'tox' && !directSockets ? languageHint(t, 'Нужно приложение', 'App required') : account.presence === 'online' ? languageHint(t, 'Отключить', 'Disconnect') : accountConnectionRunning(account) ? languageHint(t, 'Отменить', 'Cancel') : account.connectionState === 'error' ? languageHint(t, 'Повторить', 'Retry') : languageHint(t, 'Подключить', 'Connect')}</button>
+                <button className="secondary compact" disabled={account.protocol === 'tox' && !toxAvailable} title={account.protocol === 'tox' && !toxAvailable ? languageHint(t, 'Шлюз Tox не настроен.', 'The Tox gateway is not configured.') : undefined} onClick={() => accountConnectionRunning(account) ? void disconnectAccount(account) : account.protocol === 'xmpp' ? connectXmpp(account) : void connectTox(account).catch(() => undefined)}>{account.protocol === 'tox' && !toxAvailable ? languageHint(t, 'Нет сети', 'No network') : account.presence === 'online' ? languageHint(t, 'Отключить', 'Disconnect') : accountConnectionRunning(account) ? languageHint(t, 'Отменить', 'Cancel') : account.connectionState === 'error' ? languageHint(t, 'Повторить', 'Retry') : languageHint(t, 'Подключить', 'Connect')}</button>
                 <button className="icon-danger" onClick={() => { if (window.confirm(languageHint(t, `Удалить «${account.alias}»?`, `Remove “${account.alias}”?`))) void removeAccount(account); }} aria-label={languageHint(t, 'Удалить аккаунт', 'Remove account')}>×</button>
               </div>
             </div>
@@ -640,7 +638,7 @@ function Accounts({ profile, addXmpp, connectXmpp, addTox, connectTox, disconnec
           <button role="tab" aria-selected={kind === 'tox'} className={kind === 'tox' ? 'active' : ''} onClick={() => setKind('tox')}><span className="protocol-logo tox-logo"><ToxIcon/></span><strong>Tox</strong></button>
         </div>
         {kind === 'xmpp' ? <XmppAccountSetup addXmpp={addXmpp} t={t}/> : <div className="tox-onboarding">
-          <p className="panel-hint">{directSockets ? languageHint(t, 'Прямое подключение доступно.', 'Direct connection is available.') : languageHint(t, 'Профиль создастся здесь, а сеть включится в установленном приложении.', 'The profile is created here; networking activates in the installed app.')}</p><form className="connect-form" onSubmit={(event) => { event.preventDefault(); void addTox(toxAlias, toxImport || undefined).then(() => setToxImport('')); }}>
+          <p className="panel-hint">{toxAvailable ? languageHint(t, 'Подключение запустится автоматически.', 'The connection starts automatically.') : languageHint(t, 'Сеть Tox временно недоступна.', 'The Tox network is temporarily unavailable.')}</p><form className="connect-form" onSubmit={(event) => { event.preventDefault(); void addTox(toxAlias, toxImport || undefined).then(() => setToxImport('')); }}>
             <label>{languageHint(t, 'Имя', 'Name')}<input value={toxAlias} onChange={(event) => setToxAlias(event.target.value)} maxLength={128} required/></label>
             <details className="connection-advanced"><summary>{languageHint(t, 'Импорт существующего профиля', 'Import an existing profile')}</summary><label>{languageHint(t, 'Tox savedata в Base64', 'Base64 Tox savedata')}<textarea value={toxImport} onChange={(event) => setToxImport(event.target.value.trim())} rows={3}/></label></details>
             <button className="primary" type="submit">{languageHint(t, 'Создать профиль Tox', 'Create Tox profile')}</button>
@@ -736,7 +734,7 @@ function accountConnectionRunning(account: Account): boolean {
   return ['starting', 'connecting', 'authenticating', 'online', 'reconnecting'].includes(account.connectionState ?? account.presence);
 }
 function accountConnectionLabel(account: Account, t: typeof copy[Language]): string {
-  if (account.protocol === 'tox' && !hasDirectSockets()) return languageHint(t, 'Только в приложении', 'Installed app only');
+  if (account.protocol === 'tox' && !hasToxTransport()) return languageHint(t, 'Нет сети', 'No network');
   const state = account.connectionState ?? account.presence;
   const labels: Record<string, [string, string]> = {
     offline: ['Не подключён', 'Offline'], starting: ['Запускается…', 'Starting…'], connecting: ['Подключение…', 'Connecting…'], authenticating: ['Вход…', 'Signing in…'], online: ['В сети', 'Online'], reconnecting: ['Переподключение…', 'Reconnecting…'], error: ['Ошибка подключения', 'Connection error'],

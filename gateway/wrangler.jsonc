@@ -1,0 +1,13 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "relayless-tox-gateway",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1
+  },
+  "vars": {
+    "ALLOWED_ORIGINS": "https://exlexp.github.io,http://127.0.0.1:4173,http://127.0.0.1:5173,http://localhost:4173,http://localhost:5173"
+  }
+}

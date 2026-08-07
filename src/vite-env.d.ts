@@ -1,5 +1,13 @@
 /// <reference types="vite/client" />
 
+interface ImportMetaEnv {
+  readonly VITE_TOX_GATEWAY_URLS?: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+
 interface DirectSocketOpenInfo {
   readable: ReadableStream<Uint8Array>;
   writable: WritableStream<BufferSource>;

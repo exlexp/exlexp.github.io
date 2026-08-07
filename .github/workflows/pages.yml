@@ -34,6 +34,7 @@ jobs:
         run: npm run build
         env:
           PAGES_BASE_PATH: /relayless-messenger/
+          VITE_TOX_GATEWAY_URLS: ${{ vars.TOX_GATEWAY_URLS || 'wss://relayless-tox-gateway.pattern-shame.workers.dev/v1/tcp' }}
       - name: Configure Pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
       - name: Upload Pages artifact

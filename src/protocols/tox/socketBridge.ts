@@ -4,7 +4,7 @@ const MAX_QUEUE_ITEMS = 512;
 
 type SocketState = 'created' | 'opening' | 'open' | 'closed' | 'error';
 
-interface SocketActivity {
+export interface SocketActivity {
   handle: number;
   transport: 'udp' | 'tcp';
   state: SocketState;
@@ -71,7 +71,7 @@ export class ToxSocketBridge {
   private nextHandle = 1;
 
   constructor(
-    private readonly factories: ToxSocketFactories = browserSocketFactories,
+    private readonly factories: ToxSocketFactories = directSocketFactories,
     private readonly onActivity: (activity: SocketActivity) => void = () => undefined,
   ) {}
 
@@ -262,7 +262,7 @@ function validRemote(host: string, port: number): boolean {
   return Boolean(host.trim()) && Number.isInteger(port) && port > 0 && port <= 65_535;
 }
 
-const browserSocketFactories: ToxSocketFactories = {
+export const directSocketFactories: ToxSocketFactories = {
   tcp: (host, port) => new TCPSocket(host, port, { keepAlive: true, noDelay: true }),
   udp: (options) => new UDPSocket(options),
 };

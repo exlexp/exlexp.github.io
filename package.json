@@ -14,6 +14,10 @@
     "lint": "eslint . --max-warnings 0",
     "test": "vitest run",
     "test:watch": "vitest",
+    "gateway:typecheck": "tsc -p gateway/tsconfig.json --pretty false",
+    "gateway:dev": "node scripts/tox-gateway-dev.mjs",
+    "gateway:dev:worker": "wrangler dev --config gateway/wrangler.jsonc --port 8787",
+    "gateway:deploy": "wrangler deploy --config gateway/wrangler.jsonc",
     "privacy:audit": "node scripts/privacy-audit.mjs",
     "build:tox": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-tox-wasm.ps1",
     "key:development": "node scripts/generate-development-key.mjs",
@@ -21,7 +25,7 @@
     "sign:iwa": "node scripts/sign-iwa.mjs",
     "verify:signed": "wbn-sign info dist/relayless.swbn",
     "checksums": "node scripts/checksums.mjs",
-    "verify": "npm run typecheck && npm run lint && npm run test && npm run build && npm run privacy:audit"
+    "verify": "npm run typecheck && npm run gateway:typecheck && npm run lint && npm run test && npm run build && npm run privacy:audit"
   },
   "dependencies": {
     "hash-wasm": "4.12.0",
@@ -32,6 +36,7 @@
     "simple-icons": "^16.28.0"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "5.20260804.1",
     "@eslint/js": "10.0.1",
     "@testing-library/react": "16.3.2",
     "@types/node": "26.1.2",
@@ -46,6 +51,8 @@
     "typescript-eslint": "8.66.0",
     "vite": "8.2.1",
     "vitest": "4.1.10",
+    "wrangler": "4.119.0",
+    "ws": "8.21.0",
     "wbn": "0.0.9",
     "wbn-sign": "0.3.1"
   }

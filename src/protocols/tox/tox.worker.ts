@@ -1,7 +1,8 @@
 /// <reference lib="webworker" />
 
 import { base64ToBytes, bytesToBase64, utf8 } from '../../security/encoding';
-import { ToxSocketBridge } from './socketBridge';
+import { directSocketFactories, ToxSocketBridge } from './socketBridge';
+import { gatewaySocketFactories } from './webSocketSocket';
 import type { ToxBootstrapNode, ToxCommand, ToxEvent, ToxFriend, ToxWorkerRequest, ToxWorkerResponse } from './types';
 
 interface ToxCoreModule {
@@ -55,7 +56,12 @@ let module: ToxCoreModule | undefined;
 let tox = 0;
 let iterationTimer: number | undefined;
 let saveTimer: number | undefined;
-const bridge = new ToxSocketBridge();
+let bootstrapTimer: number | undefined;
+let slowConnectionTimer: number | undefined;
+let activeNodes: ToxBootstrapNode[] = [];
+let bootstrapOffset = 0;
+let selfOnline = false;
+let bridge: ToxSocketBridge | undefined;
 
 self.addEventListener('message', (message: MessageEvent<ToxWorkerRequest>) => {
   void handle(message.data.command)
@@ -68,7 +74,7 @@ self.addEventListener('message', (message: MessageEvent<ToxWorkerRequest>) => {
 
 async function handle(command: ToxCommand): Promise<unknown> {
   switch (command.type) {
-    case 'start': return start(command.savedata, command.name, command.status, command.nodes);
+    case 'start': return start(command.savedata, command.name, command.status, command.nodes, command.gatewayUrls);
     case 'stop': return stop();
     case 'snapshot': return snapshot();
     case 'set-profile':
@@ -88,10 +94,16 @@ async function handle(command: ToxCommand): Promise<unknown> {
   }
 }
 
-async function start(savedata: string | undefined, name: string, status: string, nodes: ToxBootstrapNode[]): Promise<void> {
+async function start(savedata: string | undefined, name: string, status: string, nodes: ToxBootstrapNode[], gatewayUrls: string[]): Promise<void> {
   if (tox) await stop();
   postEvent({ type: 'state', state: 'starting' });
-  module = await loadCore();
+  const directSockets = typeof TCPSocket === 'function' && typeof UDPSocket === 'function';
+  if (!directSockets && gatewayUrls.length === 0) throw new Error('Tox gateway is not configured');
+  bridge = new ToxSocketBridge(
+    directSockets ? directSocketFactories : gatewaySocketFactories(gatewayUrls),
+    ({ transport, state, host, port }) => postEvent({ type: 'transport', transport, state, host, port }),
+  );
+  module = await loadCore(directSockets);
   const savedataBytes = savedata ? base64ToBytes(savedata) : undefined;
   tox = savedataBytes?.byteLength
     ? withBytes(savedataBytes, (pointer, length) => module!._relay_tox_new(pointer, length))
@@ -101,9 +113,16 @@ async function start(savedata: string | undefined, name: string, status: string,
   setUtf8(name, (pointer, length) => module!._relay_tox_set_name(tox, pointer, length));
   setUtf8(status, (pointer, length) => module!._relay_tox_set_status(tox, pointer, length));
   postEvent({ type: 'state', state: 'connecting' });
-  for (const node of nodes.filter((item) => item.enabled && isNumericIp(item.host))) bootstrap(node);
+  activeNodes = nodes.filter((item) => item.enabled && isNumericIp(item.host));
+  bootstrapNextRelays();
   scheduleIteration();
   saveTimer = self.setInterval(emitSavedata, 30_000) as unknown as number;
+  bootstrapTimer = self.setInterval(() => {
+    if (!selfOnline) bootstrapNextRelays();
+  }, 20_000) as unknown as number;
+  slowConnectionTimer = self.setTimeout(() => {
+    if (!selfOnline) postEvent({ type: 'state', state: 'reconnecting' });
+  }, 12_000) as unknown as number;
   const current = snapshot();
   postEvent({ type: 'ready', ...current });
 }
@@ -111,14 +130,22 @@ async function start(savedata: string | undefined, name: string, status: string,
 async function stop(): Promise<void> {
   if (iterationTimer !== undefined) self.clearTimeout(iterationTimer);
   if (saveTimer !== undefined) self.clearInterval(saveTimer);
+  if (bootstrapTimer !== undefined) self.clearInterval(bootstrapTimer);
+  if (slowConnectionTimer !== undefined) self.clearTimeout(slowConnectionTimer);
   iterationTimer = undefined;
   saveTimer = undefined;
+  bootstrapTimer = undefined;
+  slowConnectionTimer = undefined;
+  activeNodes = [];
+  bootstrapOffset = 0;
+  selfOnline = false;
   if (tox && module) {
     emitSavedata();
     module._relay_tox_kill(tox);
   }
   tox = 0;
-  await bridge.shutdown();
+  await bridge?.shutdown();
+  bridge = undefined;
   postEvent({ type: 'state', state: 'offline' });
 }
 
@@ -134,6 +161,16 @@ function bootstrap(node: ToxBootstrapNode): void {
     for (const port of node.tcpPorts) module!._relay_tox_add_relay(tox, hostPointer, port, keyPointer);
     return 0;
   }));
+}
+
+function bootstrapNextRelays(): void {
+  if (!activeNodes.length) return;
+  const count = Math.min(3, activeNodes.length);
+  for (let index = 0; index < count; index += 1) {
+    const node = activeNodes[(bootstrapOffset + index) % activeNodes.length];
+    if (node) bootstrap(node);
+  }
+  bootstrapOffset = (bootstrapOffset + count) % activeNodes.length;
 }
 
 function addFriend(address: string, message: string): number {
@@ -165,7 +202,7 @@ function sendMessage(friendNumber: number, text: string): number {
   return result;
 }
 
-async function loadCore(): Promise<ToxCoreModule> {
+async function loadCore(directSockets: boolean): Promise<ToxCoreModule> {
   const publicBase = import.meta.env.BASE_URL;
   const response = await fetch(`${publicBase}tox/toxcore.mjs`, { cache: 'no-store', credentials: 'same-origin' });
   if (!response.ok) throw new Error('c-toxcore JavaScript module is unavailable');
@@ -174,21 +211,21 @@ async function loadCore(): Promise<ToxCoreModule> {
     const imported = await import(/* @vite-ignore */ objectUrl) as { default: (options: ToxCoreFactoryOptions) => Promise<ToxCoreModule> };
     return await imported.default({
     locateFile: (path) => `${publicBase}tox/${path}`,
-    relayHasDirectSockets: () => typeof TCPSocket === 'function' && typeof UDPSocket === 'function',
-    relayNetSocket: (domain, type, protocol) => bridge.socket(domain, type, protocol),
-    relayNetBind: (handle, family, port) => bridge.bind(handle, family, port),
-    relayNetConnect: (handle, host, port) => bridge.connect(handle, host, port),
-    relayNetSend: (handle, data) => bridge.send(handle, data),
-    relayNetSendTo: (handle, data, host, port) => bridge.sendTo(handle, data, host, port),
-    relayNetReceive: (handle, maximum) => bridge.receive(handle, maximum),
+    relayHasDirectSockets: () => directSockets,
+    relayNetSocket: (domain, type, protocol) => bridge!.socket(domain, type, protocol),
+    relayNetBind: (handle, family, port) => bridge!.bind(handle, family, port),
+    relayNetConnect: (handle, host, port) => bridge!.connect(handle, host, port),
+    relayNetSend: (handle, data) => bridge!.send(handle, data),
+    relayNetSendTo: (handle, data, host, port) => bridge!.sendTo(handle, data, host, port),
+    relayNetReceive: (handle, maximum) => bridge!.receive(handle, maximum),
     relayNetReceiveFrom: (handle, maximum) => {
-      const packet = bridge.receiveFrom(handle, maximum);
+      const packet = bridge!.receiveFrom(handle, maximum);
       if (!packet) return undefined;
       const address = parseNumericIp(packet.remoteAddress);
       return address ? { data: packet.data, address: address.bytes, family: address.family, port: packet.remotePort } : undefined;
     },
-    relayNetReceiveBufferSize: (handle) => bridge.receiveBufferSize(handle),
-    relayNetClose: (handle) => bridge.close(handle),
+    relayNetReceiveBufferSize: (handle) => bridge!.receiveBufferSize(handle),
+    relayNetClose: (handle) => bridge!.close(handle),
       relayEmit: handleCoreEvent,
     });
   } finally { URL.revokeObjectURL(objectUrl); }
@@ -197,7 +234,12 @@ async function loadCore(): Promise<ToxCoreModule> {
 function handleCoreEvent(event: CoreEvent): void {
   switch (event.type) {
     case 'connection':
-      postEvent({ type: 'state', state: event.status > 0 ? 'online' : 'connecting' });
+      selfOnline = event.status > 0;
+      if (selfOnline && slowConnectionTimer !== undefined) {
+        self.clearTimeout(slowConnectionTimer);
+        slowConnectionTimer = undefined;
+      }
+      postEvent({ type: 'state', state: selfOnline ? 'online' : 'reconnecting' });
       break;
     case 'friend-connection':
       postEvent({ type: 'friend-connection', friendNumber: event.friendNumber, online: event.status > 0 });

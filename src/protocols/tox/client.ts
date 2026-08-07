@@ -1,4 +1,5 @@
 import type { ToxBootstrapNode, ToxCommand, ToxEvent, ToxWorkerRequest, ToxWorkerResponse } from './types';
+import { toxGatewayUrls } from './gatewayConfig';
 
 type Listener = (event: ToxEvent) => void;
 
@@ -28,7 +29,10 @@ export class ToxClient {
     if (!response.ok) throw new Error('Bundled Tox bootstrap list is unavailable');
     const document = await response.json() as BootstrapDocument;
     validateNodes(document.nodes);
-    await this.call({ type: 'start', savedata: options.savedata, name: options.name, status: options.status ?? '', nodes: document.nodes });
+    await this.call({
+      type: 'start', savedata: options.savedata, name: options.name, status: options.status ?? '',
+      nodes: document.nodes, gatewayUrls: toxGatewayUrls(),
+    });
   }
 
   async stop(): Promise<void> {
