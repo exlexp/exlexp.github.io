@@ -118,7 +118,7 @@ async function start(savedata: string | undefined, name: string, status: string,
   scheduleIteration();
   saveTimer = self.setInterval(emitSavedata, 30_000) as unknown as number;
   bootstrapTimer = self.setInterval(() => {
-    if (!selfOnline) bootstrapNextRelays(3);
+    bootstrapNextRelays(selfOnline ? 1 : 3);
   }, 12_000) as unknown as number;
   slowConnectionTimer = self.setTimeout(() => {
     if (!selfOnline) postEvent({ type: 'state', state: 'reconnecting' });
@@ -182,6 +182,7 @@ function addFriend(address: string, message: string): number {
     module!._relay_tox_add_friend(tox, addressPointer, messagePointer, length)));
   assertCoreResult(result, 'Add friend');
   emitSavedata();
+  bootstrapNextRelays(activeNodes.length);
   return result;
 }
 
@@ -190,6 +191,7 @@ function acceptFriend(publicKey: string): number {
   const result = withBytes(hexBytes(publicKey, 32, 'public key'), (pointer) => module!._relay_tox_accept_friend(tox, pointer));
   assertCoreResult(result, 'Accept friend');
   emitSavedata();
+  bootstrapNextRelays(activeNodes.length);
   return result;
 }
 
