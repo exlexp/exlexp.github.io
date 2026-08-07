@@ -1,7 +1,7 @@
 const WEBSOCKET_REL = 'urn:xmpp:alt-connections:websocket';
 const DEFAULT_TIMEOUT_MS = 8_000;
 
-export type XmppEndpointSource = 'host-meta-json' | 'host-meta-xrd' | 'conventional';
+export type XmppEndpointSource = 'provider' | 'host-meta-json' | 'host-meta-xrd' | 'conventional';
 
 export interface DiscoveredXmppEndpoint {
   url: string;
@@ -11,8 +11,21 @@ export interface DiscoveredXmppEndpoint {
 export interface XmppDiscoveryResult {
   domain: string;
   endpoints: DiscoveredXmppEndpoint[];
+  registrationUrl?: string;
   warning?: 'cors-or-unavailable' | 'no-websocket-advertised';
 }
+
+interface KnownXmppProvider {
+  endpoints: string[];
+  registrationUrl?: string;
+}
+
+const KNOWN_PROVIDERS: Readonly<Record<string, KnownXmppProvider>> = {
+  'xmpp.jp': {
+    endpoints: ['wss://api.xmpp.jp/ws/'],
+    registrationUrl: 'https://echo.xmpp.jp/signup',
+  },
+};
 
 export function normalizeXmppDomain(value: string): string {
   const candidate = value.trim().toLowerCase().replace(/\.$/, '');
@@ -38,6 +51,14 @@ export async function discoverXmppEndpoints(
   timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<XmppDiscoveryResult> {
   const domain = normalizeXmppDomain(domainInput);
+  const knownProvider = KNOWN_PROVIDERS[domain];
+  if (knownProvider) {
+    return {
+      domain,
+      endpoints: knownProvider.endpoints.map((url) => ({ url, source: 'provider' })),
+      registrationUrl: knownProvider.registrationUrl,
+    };
+  }
   const controller = new AbortController();
   const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
   const discovered: DiscoveredXmppEndpoint[] = [];

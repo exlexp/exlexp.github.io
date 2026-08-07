@@ -1,6 +1,6 @@
 import type { Conversation, LocalProfile } from './types';
 
-export function ensureConversation(profile: LocalProfile, contactId: string, now = Date.now()): Conversation {
+export function ensureConversation(profile: LocalProfile, contactId: string, now = Date.now(), conversationId: string = crypto.randomUUID()): Conversation {
   const contact = profile.contacts.find((item) => item.id === contactId);
   if (!contact) throw new Error('Contact does not exist');
   const existing = profile.conversations.find((item) => item.contactId === contactId);
@@ -10,7 +10,7 @@ export function ensureConversation(profile: LocalProfile, contactId: string, now
     return existing;
   }
   const conversation: Conversation = {
-    id: crypto.randomUUID(),
+    id: conversationId,
     contactId,
     protocol: contact.protocol,
     title: contact.alias,

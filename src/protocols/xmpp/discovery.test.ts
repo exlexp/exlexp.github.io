@@ -22,4 +22,12 @@ describe('XMPP endpoint discovery', () => {
     expect(result.endpoints[0]?.url).toBe('wss://example.test/xmpp-websocket');
     expect(result.warning).toBe('cors-or-unavailable');
   });
+
+  it('uses the verified xmpp.jp WebSocket and its official signup page immediately', async () => {
+    const fetcher = vi.fn() as unknown as typeof fetch;
+    const result = await discoverXmppEndpoints('xmpp.jp', fetcher);
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(result.endpoints).toEqual([{ url: 'wss://api.xmpp.jp/ws/', source: 'provider' }]);
+    expect(result.registrationUrl).toBe('https://echo.xmpp.jp/signup');
+  });
 });

@@ -33,6 +33,10 @@ export class Vault {
     return this.data !== undefined;
   }
 
+  get isPersistent(): boolean {
+    return this.mode === 'persistent';
+  }
+
   get snapshot(): VaultData {
     if (!this.data) throw new Error('Vault is locked');
     return structuredClone(this.data);
@@ -115,6 +119,34 @@ export class Vault {
     if (!profile) throw new Error('Profile does not exist');
     if (profile.ephemeral) throw new Error('Ephemeral profiles cannot be exported');
     return serializeEnvelope(await encryptEnvelope({ kind: 'relayless-profile', version: 1, profile }, this.password));
+  }
+
+  async exportAccount(profileId: string, accountId: string, exportPassword?: string): Promise<string> {
+    if (!this.data) throw new Error('The vault must be unlocked to export an account');
+    const password = this.mode === 'persistent' ? this.password : exportPassword;
+    if (!password) throw new Error('A backup password is required for an ephemeral account');
+    await this.mutationQueue;
+    const profile = this.data.profiles.find((item) => item.id === profileId);
+    const account = profile?.accounts.find((item) => item.id === accountId);
+    if (!profile || !account) throw new Error('Account does not exist');
+    const contacts = profile.contacts.filter((item) => item.accountId === accountId);
+    const contactIds = new Set(contacts.map((item) => item.id));
+    const conversations = profile.conversations.filter((item) => contactIds.has(item.contactId));
+    const conversationIds = new Set(conversations.map((item) => item.id));
+    const messages = profile.messages.filter((item) => conversationIds.has(item.conversationId));
+    const drafts = Object.fromEntries(Object.entries(profile.drafts).filter(([id]) => conversationIds.has(id)));
+    const payload = {
+      kind: 'relayless-account',
+      version: 1,
+      exportedAt: Date.now(),
+      account,
+      contacts,
+      friendRequests: profile.friendRequests.filter((item) => item.accountId === accountId),
+      conversations,
+      messages,
+      drafts,
+    };
+    return serializeEnvelope(await encryptEnvelope(payload, password));
   }
 
   async importProfile(serialized: string): Promise<string> {

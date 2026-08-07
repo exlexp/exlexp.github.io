@@ -61,19 +61,46 @@ export function XmppAccountSetup({ addXmpp, t }: Props) {
   const inspectRegistration = async (event: FormEvent) => {
     event.preventDefault(); setBusy(true); setError(''); setRegistration(undefined); setAnswers({}); setComplete(false);
     try {
-      let endpoint = server.endpoint.trim();
+      const manualEndpoint = server.endpoint.trim();
       const domain = xmppDomainFromJid(server.domain);
-      if (!endpoint) {
+      let endpoints = manualEndpoint ? [manualEndpoint] : [];
+      if (!manualEndpoint) {
         const result = await discoverXmppEndpoints(domain);
-        endpoint = result.endpoints[0]?.url ?? '';
+        endpoints = result.endpoints.map((item) => item.url);
         setDiscoveryNote(discoveryMessage(result.warning, ru));
+        if (result.registrationUrl) {
+          const endpoint = endpoints[0] ?? '';
+          setServer({ domain, endpoint });
+          registrationClient.current?.close(); registrationClient.current = undefined;
+          setRegistration({
+            domain,
+            instructions: ru
+              ? 'Этот сервер создаёт аккаунты на своей защищённой странице. Откройте её, зарегистрируйтесь и затем вернитесь сюда для входа.'
+              : 'This provider creates accounts on its secure signup page. Open it, register, then return here to sign in.',
+            fields: [], legacy: false, captcha: false,
+            redirectUrl: result.registrationUrl, alreadyRegistered: false,
+          });
+          return;
+        }
       }
-      setServer({ domain, endpoint });
-      const client = new XmppRegistrationClient();
-      registrationClient.current?.close(); registrationClient.current = client;
-      const form = await client.inspect({ domain, endpoint });
-      setRegistration(form);
-      setAnswers(Object.fromEntries(form.fields.filter((field) => field.values.length > 0).map((field) => [field.key, field.type === 'list-multi' ? field.values : field.values[0] ?? ''])));
+      if (endpoints.length === 0) throw new Error(ru ? 'Сервер не сообщил адрес подключения.' : 'The server did not provide a connection address.');
+
+      let lastReason: unknown;
+      for (const endpoint of endpoints) {
+        const client = new XmppRegistrationClient();
+        registrationClient.current?.close(); registrationClient.current = client;
+        try {
+          const form = await client.inspect({ domain, endpoint });
+          setServer({ domain, endpoint });
+          setRegistration(form);
+          setAnswers(Object.fromEntries(form.fields.filter((field) => field.values.length > 0).map((field) => [field.key, field.type === 'list-multi' ? field.values : field.values[0] ?? ''])));
+          return;
+        } catch (reason) {
+          lastReason = reason;
+          client.close();
+        }
+      }
+      throw lastReason ?? new Error(ru ? 'Не удалось подключиться к серверу.' : 'Could not connect to the server.');
     } catch (reason) { setError(registrationErrorMessage(reason, ru)); registrationClient.current?.close(); }
     finally { setBusy(false); }
   };

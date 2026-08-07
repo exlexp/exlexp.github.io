@@ -45,4 +45,28 @@ describe('vault persistence', () => {
     expect(importedId).not.toBe(originalId);
     expect(vault.snapshot.profiles.find((profile) => profile.id === importedId)?.accounts[0]?.secret).toBe('profile-secret');
   });
+
+  it('exports one account and its related history without plaintext leakage', async () => {
+    await vault.create('a sufficiently long password', 'en', { iterations: 1, memoryKiB: 64, parallelism: 1 });
+    const profileId = vault.snapshot.profiles[0]!.id;
+    await vault.update((draft) => {
+      const profile = draft.profiles[0]!;
+      profile.accounts.push({ id: 'tox-account', protocol: 'tox', address: 'TOX-ID', alias: 'Private Tox', savedata: 'private-savedata', presence: 'offline', enabled: true });
+      profile.contacts.push({ id: 'contact', accountId: 'tox-account', protocol: 'tox', address: 'FRIEND', alias: 'Friend', presence: 'offline' });
+      profile.conversations.push({ id: 'conversation', contactId: 'contact', protocol: 'tox', title: 'Friend', unread: 0, updatedAt: 1 });
+      profile.messages.push({ id: 'message', conversationId: 'conversation', direction: 'incoming', body: 'private message', timestamp: 1, delivery: 'delivered' });
+    });
+    const backup = await vault.exportAccount(profileId, 'tox-account');
+    expect(backup).not.toContain('private-savedata');
+    expect(backup).not.toContain('private message');
+    expect(backup).not.toContain('Friend');
+  });
+
+  it('requires an explicit encryption password for ephemeral account exports', async () => {
+    vault.createEphemeral('en');
+    const profile = vault.snapshot.profiles[0]!;
+    await vault.update((draft) => { draft.profiles[0]!.accounts.push({ id: 'account', protocol: 'tox', address: 'TOX-ID', alias: 'Tox', savedata: 'secret', presence: 'offline', enabled: true }); });
+    await expect(vault.exportAccount(profile.id, 'account')).rejects.toThrow(/password/i);
+    await expect(vault.exportAccount(profile.id, 'account', 'backup password')).resolves.toContain('ciphertext');
+  });
 });

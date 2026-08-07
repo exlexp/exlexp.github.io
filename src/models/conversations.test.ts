@@ -15,6 +15,12 @@ describe('conversations', () => {
     expect(profile.conversations).toHaveLength(1);
   });
 
+  it('uses a preallocated conversation id for immediate contact navigation', () => {
+    const profile = createEmptyVault('en').profiles[0]!;
+    profile.contacts.push({ id: 'contact', accountId: 'tox', protocol: 'tox', address: 'ABCDEF', alias: 'Alice', presence: 'offline' });
+    expect(ensureConversation(profile, 'contact', 10, 'optimistic-chat').id).toBe('optimistic-chat');
+  });
+
   it('searches titles, addresses and local message text', () => {
     const profile = createEmptyVault('en').profiles[0]!;
     profile.contacts.push({ id: 'contact', accountId: 'tox', protocol: 'tox', address: 'ABCDEF', alias: 'Alice', presence: 'offline' });

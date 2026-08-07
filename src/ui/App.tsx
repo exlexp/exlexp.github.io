@@ -521,23 +521,54 @@ export function App() {
 
   const selectConversation = async (profileId: string, conversationId: string) => {
     if (data.activeProfileId !== profileId) await selectProfile(profileId);
-    await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === profileId); if (profile) { profile.ui.lastConversationId = conversationId; const conversation = profile.conversations.find((item) => item.id === conversationId); if (conversation) conversation.unread = 0; } });
-    refresh(); setProfileScope(profileId); setSelectedConversation(conversationId);
+    else {
+      const optimistic = structuredClone(data);
+      const profile = optimistic.profiles.find((item) => item.id === profileId);
+      if (profile) {
+        profile.ui.lastConversationId = conversationId;
+        const conversation = profile.conversations.find((item) => item.id === conversationId);
+        if (conversation) conversation.unread = 0;
+        setData(optimistic);
+      }
+      setProfileScope(profileId);
+      setSelectedConversation(conversationId);
+    }
+    try {
+      await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === profileId); if (profile) { profile.ui.lastConversationId = conversationId; const conversation = profile.conversations.find((item) => item.id === conversationId); if (conversation) conversation.unread = 0; } });
+      refresh(); setProfileScope(profileId); setSelectedConversation(conversationId);
+    } catch (reason) { refresh(); setError(redactError(reason)); throw reason; }
   };
 
   const openContact = async (contactId: string) => {
-    const profileId = data.activeProfileId;
-    let conversationId = '';
-    await vault.update((draft) => {
+    const latest = vault.snapshot;
+    const profileId = latest.activeProfileId;
+    const current = activeProfile(latest);
+    if (!current.contacts.some((item) => item.id === contactId)) throw new Error('Contact is no longer available');
+    const conversationId = current.conversations.find((item) => item.contactId === contactId)?.id ?? crypto.randomUUID();
+    const optimistic = structuredClone(latest);
+    const optimisticProfile = optimistic.profiles.find((item) => item.id === profileId);
+    if (!optimisticProfile) throw new Error('Profile is no longer available');
+    const optimisticConversation = ensureConversation(optimisticProfile, contactId, Date.now(), conversationId);
+    optimisticConversation.unread = 0;
+    optimisticProfile.ui.lastConversationId = conversationId;
+    setData(optimistic);
+    setProfileScope(profileId);
+    setSelectedConversation(conversationId);
+    setScreen('chats');
+    try {
+      await vault.update((draft) => {
       const profile = draft.profiles.find((item) => item.id === profileId);
       if (!profile) return;
-      const conversation = ensureConversation(profile, contactId);
-      conversationId = conversation.id;
+      const conversation = ensureConversation(profile, contactId, Date.now(), conversationId);
       conversation.unread = 0;
-      profile.ui.lastConversationId = conversation.id;
-    });
-    if (!conversationId) throw new Error('Contact is no longer available');
-    refresh(); setProfileScope(profileId); setSelectedConversation(conversationId); setScreen('chats');
+      profile.ui.lastConversationId = conversationId;
+      });
+      refresh();
+    } catch (reason) {
+      refresh();
+      setError(redactError(reason));
+      throw reason;
+    }
   };
 
   const renameContact = async (contactId: string, name: string) => {
@@ -604,7 +635,7 @@ export function App() {
         <main className="workspace">
           <WorkspaceErrorBoundary resetKey={`${screen}:${currentProfile.id}`} language={language}>
           {screen === 'chats' && <Messenger data={data} scope={profileScope} selected={selectedConversation} onBack={() => setSelectedConversation(undefined)} selectConversation={selectConversation} setScreen={setScreen} sendMessage={sendMessage} setSource={setConversationSource} saveDraft={saveDraft} t={t}/>} 
-          {screen === 'accounts' && <Accounts profile={currentProfile} addXmpp={addXmpp} connectXmpp={(account) => connectXmpp(account, currentProfile.id)} addTox={addTox} connectTox={(account) => connectTox(account, currentProfile.id)} disconnectAccount={disconnectAccount} removeAccount={removeAccount} t={t}/>} 
+          {screen === 'accounts' && <Accounts profile={currentProfile} addXmpp={addXmpp} connectXmpp={(account) => connectXmpp(account, currentProfile.id)} addTox={addTox} connectTox={(account) => connectTox(account, currentProfile.id)} disconnectAccount={disconnectAccount} removeAccount={removeAccount} exportAccount={async (account) => { try { let exportPassword: string | undefined; if (!vault.isPersistent) { exportPassword = window.prompt(languageHint(t, 'Придумайте пароль для зашифрованной копии (минимум 10 символов)', 'Create a password for the encrypted backup (at least 10 characters)'))?.trim(); if (!exportPassword) return; } downloadText(await vault.exportAccount(currentProfile.id, account.id, exportPassword), `${safeFilename(account.alias)}.rlaccount`); } catch (reason) { setError(redactError(reason)); } }} t={t}/>}
           {screen === 'contacts' && <Contacts profile={currentProfile} acceptToxFriend={acceptToxFriend} rejectToxFriend={rejectToxFriend} addXmppContact={addXmppContact} addToxFriend={addToxFriend} openContact={openContact} renameContact={renameContact} goToAccounts={() => setScreen('accounts')} t={t}/>}
           {screen === 'privacy' && <Privacy data={data} profile={currentProfile} network={network} t={t} onLock={lock} onWipe={async () => { await vault.wipe(); setData(undefined); setGate('launch'); }} onExport={async () => downloadText(await vault.exportEncrypted(), 'relayless-vault.rlvault')}/>} 
           {screen === 'plugins' && <Plugins data={data} t={t} onInstall={async (source, granted) => { const manifest = parsePluginManifest(source); await vault.update((draft) => { draft.plugins = installPlugin(manifest, granted, draft.plugins); }); refresh(); }} onToggle={async (id) => { await vault.update((draft) => { const plugin = draft.plugins.find((item) => item.manifest.id === id); if (plugin) plugin.enabled = !plugin.enabled; }); refresh(); }} onRemove={async (id) => { await vault.update((draft) => { draft.plugins = draft.plugins.filter((item) => item.manifest.id !== id); }); refresh(); }}/>} 
@@ -688,7 +719,7 @@ function ActiveChat({ profile, conversation, messages, onBack, send, setSource, 
   return <><div className="chat-head"><button className="back-button" onClick={onBack} aria-label={languageHint(t, 'Назад', 'Back')}><ArrowIcon/></button><span className="chat-avatar">{conversation.title.slice(0, 2).toUpperCase()}</span><div className="chat-head-copy"><h2>{conversation.title}</h2><small>{presenceLabel(contact?.presence ?? 'offline', t)}</small></div><span className={`security-state ${security.tone}`}>{conversation.protocol === 'tox' ? <ToxIcon/> : <XmppIcon/>}{security.label}</span></div><div className="messages">{messages.length === 0 && <div className="conversation-start"><strong>{conversation.title}</strong><span>{security.label}</span><p>{languageHint(t, 'Напишите первое сообщение.', 'Write the first message.')}</p></div>}{hiddenMessageCount > 0 && <button className="load-older" onClick={() => setVisibleCount((count) => count + MESSAGE_RENDER_BATCH)}>{languageHint(t, `Показать ещё ${Math.min(hiddenMessageCount, MESSAGE_RENDER_BATCH)}`, `Show ${Math.min(hiddenMessageCount, MESSAGE_RENDER_BATCH)} more`)}</button>}{visibleMessages.map((message) => <article key={message.id} className={`${message.direction} ${message.delivery === 'failed' ? 'failed' : ''}`}><p>{message.body}<span className="message-meta"><time>{formatTime(message.timestamp)}</time>{message.direction === 'outgoing' && <MessageDelivery state={message.delivery} t={t}/>}</span></p></article>)}<div className="message-anchor" ref={messagesEnd}/></div><form className="composer" onSubmit={(event) => { event.preventDefault(); const value = body.trim(); if (!value || !sourceId) return; setBody(''); void send(profile.id, conversation, value, sourceId).catch(() => setBody(value)); }}>{identities.length > 1 && <select className="identity-selector" aria-label={languageHint(t, 'Отправить от имени', 'Send as')} value={sourceId} onChange={(event) => void setSource(profile.id, conversation.id, event.target.value)} required><option value="" disabled>{languageHint(t, 'Выберите аккаунт', 'Choose account')}</option>{identities.map((identity) => <option key={identity.id} value={identity.id}>{identity.alias}</option>)}</select>}<textarea rows={1} value={body} onChange={(event) => setBody(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} onBlur={() => void saveDraft(profile.id, conversation.id, body)} placeholder={sourceId ? languageHint(t, 'Сообщение', 'Message') : languageHint(t, 'Сначала выберите аккаунт', 'Choose an account first')} maxLength={conversation.protocol === 'tox' ? TOX_MESSAGE_MAX_BYTES : XMPP_MESSAGE_MAX_BYTES}/><button type="submit" title={t.send} aria-label={t.send} disabled={!sourceId || !body.trim()}><SendIcon/></button></form></>;
 }
 
-function Accounts({ profile, addXmpp, connectXmpp, addTox, connectTox, disconnectAccount, removeAccount, t }: { profile: LocalProfile; addXmpp: (account: Account) => Promise<void>; connectXmpp: (account: Account) => void; addTox: (alias: string, savedata?: string) => Promise<void>; connectTox: (account: Account) => Promise<ToxClient>; disconnectAccount: (account: Account) => Promise<void>; removeAccount: (account: Account) => Promise<void>; t: typeof copy[Language] }) {
+function Accounts({ profile, addXmpp, connectXmpp, addTox, connectTox, disconnectAccount, removeAccount, exportAccount, t }: { profile: LocalProfile; addXmpp: (account: Account) => Promise<void>; connectXmpp: (account: Account) => void; addTox: (alias: string, savedata?: string) => Promise<void>; connectTox: (account: Account) => Promise<ToxClient>; disconnectAccount: (account: Account) => Promise<void>; removeAccount: (account: Account) => Promise<void>; exportAccount: (account: Account) => Promise<void>; t: typeof copy[Language] }) {
   const [kind, setKind] = useState<'xmpp' | 'tox'>('xmpp');
   const [toxAlias, setToxAlias] = useState('Tox');
   const [toxImport, setToxImport] = useState('');
@@ -705,6 +736,7 @@ function Accounts({ profile, addXmpp, connectXmpp, addTox, connectTox, disconnec
               <span className={`state ${account.protocol === 'tox' && !toxAvailable ? 'error' : account.connectionState ?? account.presence}`} title={account.connectionDetail}>{accountConnectionLabel(account, t)}</span>
               <div className="account-actions">
                 {account.address && <button className="icon-text" onClick={() => void navigator.clipboard.writeText(account.address)}>{languageHint(t, 'Копировать', 'Copy')}</button>}
+                <button className="icon-text" title={languageHint(t, 'Скачать зашифрованную копию аккаунта', 'Download an encrypted account backup')} onClick={() => void exportAccount(account)}>{languageHint(t, 'Экспорт', 'Export')}</button>
                 <button className="secondary compact" disabled={account.protocol === 'tox' && !toxAvailable} title={account.protocol === 'tox' && !toxAvailable ? languageHint(t, 'Шлюз Tox не настроен.', 'The Tox gateway is not configured.') : undefined} onClick={() => accountConnectionRunning(account) ? void disconnectAccount(account) : account.protocol === 'xmpp' ? connectXmpp(account) : void connectTox(account).catch(() => undefined)}>{account.protocol === 'tox' && !toxAvailable ? languageHint(t, 'Нет сети', 'No network') : account.presence === 'online' ? languageHint(t, 'Отключить', 'Disconnect') : accountConnectionRunning(account) ? languageHint(t, 'Отменить', 'Cancel') : account.connectionState === 'error' ? languageHint(t, 'Повторить', 'Retry') : languageHint(t, 'Подключить', 'Connect')}</button>
                 <button className="icon-danger" onClick={() => { if (window.confirm(languageHint(t, `Удалить «${account.alias}»?`, `Remove “${account.alias}”?`))) void removeAccount(account); }} aria-label={languageHint(t, 'Удалить аккаунт', 'Remove account')}>×</button>
               </div>
@@ -775,7 +807,7 @@ function ContactRow({ contact, open, rename, t }: { contact: Contact; open: () =
 
 function Privacy({ data, profile, network, t, onLock, onWipe, onExport }: { data: VaultData; profile: LocalProfile; network: NetworkActivity[]; t: typeof copy[Language]; onLock: () => void; onWipe: () => Promise<void>; onExport: () => Promise<void> }) {
   const messageCount = data.profiles.reduce((count, item) => count + item.messages.length, 0);
-  return <div className="single-page privacy-page"><PageTitle index="04" title={t.privacy} subtitle={profile.name}/><section className="summary-list"><div><span>{languageHint(t, 'Сообщения на устройстве', 'Messages on device')}</span><strong>{messageCount}</strong></div><div><span>{t.currentConnections}</span><strong>{network.filter((item) => item.state === 'open').length}</strong></div></section><p className="simple-notice">{languageHint(t, 'Данные хранятся только на этом устройстве. Вы можете заблокировать приложение или скачать резервную копию.', 'Data stays on this device. You can lock the app or download a backup.')}</p><section className="vault-actions"><button onClick={() => void onExport()}><DownloadIcon/><span><strong>{languageHint(t, 'Скачать резервную копию', 'Download backup')}</strong><small>{languageHint(t, 'Копия защищена вашим паролем', 'Protected with your password')}</small></span><ArrowIcon/></button><button onClick={onLock}><LockIcon/><span><strong>{t.lock}</strong><small>{languageHint(t, 'Потребуется снова ввести пароль', 'You will need to enter your password again')}</small></span><ArrowIcon/></button><button className="danger" onClick={() => { if (window.confirm(t.dangerWipe)) void onWipe(); }}><span className="delete-x">×</span><span><strong>{t.wipe}</strong><small>{t.dangerWipe}</small></span><ArrowIcon/></button></section></div>;
+  return <div className="single-page privacy-page"><PageTitle index="04" title={t.privacy} subtitle={profile.name}/><section className="summary-list"><div><span>{languageHint(t, 'Сообщения на устройстве', 'Messages on device')}</span><strong>{messageCount}</strong></div><div><span>{t.currentConnections}</span><strong>{network.filter((item) => item.state === 'open').length}</strong></div></section><p className="simple-notice">{languageHint(t, 'Хранилище, пароли, ключи и история остаются на устройстве и не отправляются в Relayless. Для связи XMPP передаёт данные входа только выбранному серверу по WSS, а Tox-шлюз пересылает зашифрованные пакеты. Аналитики и трекеров нет.', 'The vault, passwords, keys, and history stay on this device and are never sent to Relayless. To communicate, XMPP sends credentials only to the selected server over WSS, while the Tox gateway forwards encrypted packets. There are no analytics or trackers.')}</p><section className="vault-actions"><button onClick={() => void onExport()}><DownloadIcon/><span><strong>{languageHint(t, 'Скачать резервную копию', 'Download backup')}</strong><small>{languageHint(t, 'Копия защищена вашим паролем', 'Protected with your password')}</small></span><ArrowIcon/></button><button onClick={onLock}><LockIcon/><span><strong>{t.lock}</strong><small>{languageHint(t, 'Потребуется снова ввести пароль', 'You will need to enter your password again')}</small></span><ArrowIcon/></button><button className="danger" onClick={() => { if (window.confirm(t.dangerWipe)) void onWipe(); }}><span className="delete-x">×</span><span><strong>{t.wipe}</strong><small>{t.dangerWipe}</small></span><ArrowIcon/></button></section></div>;
 }
 
 function Plugins({ data, t, onInstall, onToggle, onRemove }: { data: VaultData; t: typeof copy[Language]; onInstall: (source: string, granted: PluginPermission[]) => Promise<void>; onToggle: (id: string) => Promise<void>; onRemove: (id: string) => Promise<void> }) {
