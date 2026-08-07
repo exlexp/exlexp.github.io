@@ -21,6 +21,7 @@ import { PlaintextConfirmationRequired, resolveEncryptionProvider } from '../enc
 import { requestLocalNotifications, showLocalMessageNotification } from './notifications';
 import { XmppAccountSetup } from './XmppAccountSetup';
 import type { OmemoEngine } from '../encryption/omemo';
+import { OtrManager, type OtrEvent } from '../encryption/otr';
 
 type Screen = 'chats' | 'accounts' | 'contacts' | 'privacy' | 'plugins' | 'settings';
 type Gate = 'loading' | 'launch' | 'unlock' | 'open';
@@ -45,6 +46,8 @@ export function App() {
   const xmppClients = useRef(new Map<string, XmppClient>());
   const omemoEngines = useRef(new Map<string, OmemoEngine>());
   const omemoInitializations = useRef(new Map<string, Promise<OmemoEngine>>());
+  const otrManagers = useRef(new Map<string, OtrManager>());
+  const otrInitializations = useRef(new Map<string, Promise<OtrManager>>());
   const toxClients = useRef(new Map<string, ToxClient>());
   const toxSavedata = useRef(new Map<string, string>());
   const viewState = useRef<{ activeProfileId?: string; screen: Screen; conversationId?: string }>({ screen: 'chats' });
@@ -69,8 +72,22 @@ export function App() {
   useEffect(() => () => {
     for (const client of xmppClients.current.values()) client.stop();
     omemoEngines.current.clear(); omemoInitializations.current.clear();
+    for (const manager of otrManagers.current.values()) manager.close();
+    otrManagers.current.clear(); otrInitializations.current.clear();
     for (const client of toxClients.current.values()) void client.stop();
   }, []);
+
+  useEffect(() => {
+    if (!data) return;
+    const allowedProfiles = new Set(data.profiles.filter((profile) => !profile.locked).map((profile) => profile.id));
+    for (const [key, manager] of otrManagers.current) {
+      const profileId = key.split(':', 1)[0];
+      if (profileId && allowedProfiles.has(profileId)) continue;
+      manager.close();
+      otrManagers.current.delete(key);
+      otrInitializations.current.delete(key);
+    }
+  }, [data]);
 
   useEffect(() => {
     if (gate !== 'open' || !data) return;
@@ -146,6 +163,8 @@ export function App() {
     for (const client of xmppClients.current.values()) client.stop();
     for (const client of toxClients.current.values()) void client.stop();
     xmppClients.current.clear(); omemoEngines.current.clear(); omemoInitializations.current.clear(); toxClients.current.clear();
+    for (const manager of otrManagers.current.values()) manager.close();
+    otrManagers.current.clear(); otrInitializations.current.clear();
     await vault.disableDeviceUnlock().catch(() => undefined);
     vault.lock(); setData(undefined); setGate('unlock');
   }
@@ -174,6 +193,7 @@ export function App() {
     for (const accountId of stopAccountIds) {
       const key = `${previousId}:${accountId}`;
       xmppClients.current.get(key)?.stop(); xmppClients.current.delete(key); omemoEngines.current.delete(key); omemoInitializations.current.delete(key);
+      otrManagers.current.get(key)?.close(); otrManagers.current.delete(key); otrInitializations.current.delete(key);
       void toxClients.current.get(key)?.stop(); toxClients.current.delete(key);
     }
     refresh(); setProfileScope(profileId); setSelectedConversation(target.ui.lastConversationId); setScreen('chats');
@@ -198,7 +218,10 @@ export function App() {
     const key = `${profileId}:${account.id}`;
     const existing = xmppClients.current.get(key);
     if (existing && account.connectionState !== 'error') return;
-    if (existing) { existing.stop(); xmppClients.current.delete(key); omemoEngines.current.delete(key); omemoInitializations.current.delete(key); }
+    if (existing) {
+      existing.stop(); xmppClients.current.delete(key); omemoEngines.current.delete(key); omemoInitializations.current.delete(key);
+      otrManagers.current.get(key)?.reset();
+    }
     const client = new XmppClient();
     client.subscribe((event) => {
       if (event.type === 'state') {
@@ -213,7 +236,11 @@ export function App() {
           }
         }).then(() => {
           refresh();
-          if (event.state === 'online') void initializeOmemo(client, account, profileId).catch((reason) => setError(redactError(reason)));
+          if (event.state === 'online') {
+            void initializeOmemo(client, account, profileId).catch((reason) => setError(redactError(reason)));
+          } else if (event.state === 'offline' || event.state === 'error') {
+            otrManagers.current.get(key)?.reset();
+          }
         });
       }
       if (event.type === 'roster') {
@@ -229,8 +256,17 @@ export function App() {
       if (event.type === 'presence') {
         void vault.update((draft) => {
           const contact = draft.profiles.find((item) => item.id === profileId)?.contacts.find((item) => item.accountId === account.id && item.address === event.from);
-          if (contact) contact.presence = event.show === 'offline' ? 'offline' : event.show === 'away' || event.show === 'xa' ? 'away' : event.show === 'dnd' ? 'busy' : 'online';
+          if (contact) {
+            contact.presence = event.show === 'offline' ? 'offline' : event.show === 'away' || event.show === 'xa' ? 'away' : event.show === 'dnd' ? 'busy' : 'online';
+            if (event.show !== 'offline' && event.peer.includes('/')) contact.resource = event.peer;
+            if (event.show === 'offline' && contact.resource === event.peer) contact.resource = undefined;
+          }
         }).then(refresh);
+      }
+      if (event.type === 'otr-wire') {
+        void initializeOtr(client, account, profileId)
+          .then((manager) => manager.receive(event.peer, event.body, event.id, event.timestamp))
+          .catch((reason) => setError(redactError(reason)));
       }
       if (event.type === 'message') {
         const profileName = vault.snapshot.profiles.find((item) => item.id === profileId)?.name ?? 'Relayless';
@@ -244,6 +280,7 @@ export function App() {
             contact = { id: crypto.randomUUID(), accountId: account.id, protocol: 'xmpp', address: event.from, alias: event.from, presence: 'offline' };
             profile.contacts.push(contact);
           }
+          if (event.peer.includes('/')) contact.resource = event.peer;
           let conversation = profile.conversations.find((item) => item.contactId === contact.id);
           if (!conversation) {
             conversation = { id: crypto.randomUUID(), contactId: contact.id, protocol: 'xmpp', title: contact.alias, unread: 0, updatedAt: event.timestamp, sourceAccountId: account.id, encryption: { policy: profile.settings.defaultEncryptionPolicy, provider: 'plaintext', verified: false, devices: [], warning: 'tls-only' } };
@@ -345,6 +382,112 @@ export function App() {
     finally {
       if (omemoInitializations.current.get(key) === initialization) omemoInitializations.current.delete(key);
     }
+  };
+
+  const initializeOtr = async (client: XmppClient, account: Account, profileId: string): Promise<OtrManager> => {
+    const key = `${profileId}:${account.id}`;
+    const existing = otrManagers.current.get(key);
+    if (existing) return existing;
+    const pending = otrInitializations.current.get(key);
+    if (pending) return pending;
+    const initialization = OtrManager.open(
+      vault.snapshot.profiles.find((item) => item.id === profileId)?.otrAccounts[account.id],
+      async (state) => {
+        await vault.update((draft) => {
+          const profile = draft.profiles.find((item) => item.id === profileId);
+          if (profile) profile.otrAccounts[account.id] = state;
+        });
+      },
+    ).then((manager) => {
+      manager.subscribe((event) => handleOtrEvent(client, account, profileId, manager, event));
+      otrManagers.current.set(key, manager);
+      return manager;
+    });
+    otrInitializations.current.set(key, initialization);
+    try { return await initialization; }
+    finally {
+      if (otrInitializations.current.get(key) === initialization) otrInitializations.current.delete(key);
+    }
+  };
+
+  const handleOtrEvent = (client: XmppClient, account: Account, profileId: string, manager: OtrManager, event: OtrEvent) => {
+    if (event.type === 'error') {
+      if (event.severity === 'error') setError(`OTR: ${event.message}`);
+      return;
+    }
+    if (event.type === 'wire') {
+      try {
+        const stanzaId = client.sendOtrMessage(event.peer, event.body, Boolean(event.localId));
+        if (event.localId) {
+          void vault.update((draft) => {
+            const message = draft.profiles.find((item) => item.id === profileId)?.messages.find((item) => item.id === event.localId);
+            if (message) { message.id = stanzaId; message.delivery = 'sent'; }
+          }).then(refresh);
+        }
+      } catch (reason) {
+        if (event.localId) {
+          void vault.update((draft) => {
+            const message = draft.profiles.find((item) => item.id === profileId)?.messages.find((item) => item.id === event.localId);
+            if (message) message.delivery = 'failed';
+          }).then(refresh);
+        }
+        setError(redactError(reason));
+      }
+      return;
+    }
+    if (event.type === 'state') {
+      if (event.state !== 'encrypted') return;
+      void vault.update((draft) => {
+        const profile = draft.profiles.find((item) => item.id === profileId);
+        const contact = profile?.contacts.find((item) => item.accountId === account.id && item.address === bareAddress(event.peer));
+        const conversation = contact ? profile?.conversations.find((item) => item.contactId === contact.id) : undefined;
+        if (!conversation) return;
+        const previous = conversation.encryption?.devices.find((item) => item.id === `otr:${event.peer}`);
+        const changed = Boolean(previous?.fingerprint && event.fingerprint && previous.fingerprint !== event.fingerprint);
+        const device = {
+          id: `otr:${event.peer}`, label: 'OTR v2/v3', fingerprint: event.fingerprint ?? '',
+          trust: changed ? 'untrusted' as const : previous?.trust ?? 'untrusted' as const,
+          firstSeenAt: previous?.firstSeenAt ?? Date.now(), changedAt: changed ? Date.now() : previous?.changedAt,
+        };
+        conversation.encryption = {
+          policy: conversation.encryption?.policy ?? 'force-otr', provider: 'otr',
+          verified: device.trust === 'trusted' && !changed, devices: [device], warning: changed ? 'changed-device' : device.trust === 'trusted' ? undefined : 'first-use',
+        };
+      }).then(refresh);
+      return;
+    }
+    const profileName = vault.snapshot.profiles.find((item) => item.id === profileId)?.name ?? 'Relayless';
+    let shouldNotify = false;
+    let conversationTitle = bareAddress(event.peer);
+    void vault.update((draft) => {
+      const profile = draft.profiles.find((item) => item.id === profileId); if (!profile) return;
+      const messageId = event.messageId || crypto.randomUUID();
+      if (profile.messages.some((item) => item.id === messageId)) return;
+      const bare = bareAddress(event.peer);
+      let contact = profile.contacts.find((item) => item.accountId === account.id && item.address === bare);
+      if (!contact) {
+        contact = { id: crypto.randomUUID(), accountId: account.id, protocol: 'xmpp', address: bare, alias: bare, presence: 'online', resource: event.peer };
+        profile.contacts.push(contact);
+      } else contact.resource = event.peer;
+      let conversation = profile.conversations.find((item) => item.contactId === contact.id);
+      const fingerprint = manager.fingerprintFor(event.peer);
+      const device = { id: `otr:${event.peer}`, label: 'OTR v2/v3', fingerprint, trust: 'untrusted' as const, firstSeenAt: Date.now() };
+      if (!conversation) {
+        conversation = { id: crypto.randomUUID(), contactId: contact.id, protocol: 'xmpp', title: contact.alias, unread: 0, updatedAt: event.timestamp ?? Date.now(), sourceAccountId: account.id, encryption: { policy: 'force-otr', provider: 'otr', verified: false, devices: [device], warning: 'first-use' } };
+        profile.conversations.push(conversation);
+      } else if (conversation.encryption?.provider !== 'otr') {
+        conversation.encryption = { policy: conversation.encryption?.policy ?? 'force-otr', provider: 'otr', verified: false, devices: [device], warning: 'first-use' };
+      }
+      const timestamp = event.timestamp ?? Date.now();
+      const visible = viewState.current.activeProfileId === profileId && viewState.current.screen === 'chats' && viewState.current.conversationId === conversation.id;
+      recordIncomingActivity(conversation, visible, timestamp);
+      conversationTitle = conversation.title; shouldNotify = !visible;
+      profile.messages.push({ id: messageId, conversationId: conversation.id, direction: 'incoming', body: event.body, timestamp, delivery: 'delivered', sourceAccountId: account.id, encryptionProvider: 'otr' });
+    }).then(() => {
+      refresh();
+      if (event.messageId) client.sendReceipt(event.peer, event.messageId);
+      if (shouldNotify) showLocalMessageNotification(profileName, conversationTitle, event.body, vault.snapshot.settings.showNotificationPreviews);
+    });
   };
 
   const addTox = async (alias: string, savedata?: string) => {
@@ -558,10 +701,14 @@ export function App() {
     validateOutgoingMessage(conversation.protocol, body, t);
     let provider: 'tox' | 'plaintext' | 'omemo' | 'otr' = source.protocol === 'tox' ? 'tox' : 'plaintext';
     if (source.protocol === 'xmpp') {
+      const client = xmppClients.current.get(`${profileId}:${sourceAccountId}`);
+      if (!client) throw new Error(languageHint(t, 'Сначала подключите XMPP-аккаунт.', 'Connect the XMPP account first.'));
+      const policy = conversation.encryption?.policy ?? profile.settings.defaultEncryptionPolicy;
+      if (policy === 'force-otr' && !otrManagers.current.has(`${profileId}:${sourceAccountId}`)) await initializeOtr(client, source, profileId);
       const omemoAvailable = omemoEngines.current.has(`${profileId}:${sourceAccountId}`);
+      const otrAvailable = otrManagers.current.has(`${profileId}:${sourceAccountId}`) && Boolean(contact.resource);
       try {
-        const policy = conversation.encryption?.policy ?? profile.settings.defaultEncryptionPolicy;
-        provider = resolveEncryptionProvider(policy, { omemo: omemoAvailable, otr: false }, policy === 'plaintext') as 'plaintext' | 'omemo' | 'otr';
+        provider = resolveEncryptionProvider(policy, { omemo: omemoAvailable, otr: otrAvailable }, policy === 'plaintext') as 'plaintext' | 'omemo' | 'otr';
       } catch (reason) {
         if (!(reason instanceof PlaintextConfirmationRequired) || !window.confirm(languageHint(t, 'OMEMO/OTR недоступен. Отправить это сообщение через XMPP с защитой только TLS?', 'OMEMO/OTR is unavailable. Send this message over TLS-only XMPP?'))) throw reason;
         provider = 'plaintext';
@@ -578,7 +725,7 @@ export function App() {
         current.sourceAccountId = sourceAccountId;
         current.encryption = provider === 'tox'
           ? { policy: 'secure-auto', provider: 'tox', verified: true, devices: [] }
-          : { policy: current.encryption?.policy ?? target.settings.defaultEncryptionPolicy, provider, verified: false, devices: current.encryption?.devices ?? [], warning: provider === 'omemo' ? 'first-use' : 'tls-only' };
+          : { policy: current.encryption?.policy ?? target.settings.defaultEncryptionPolicy, provider, verified: false, devices: current.encryption?.devices ?? [], warning: provider === 'omemo' || provider === 'otr' ? 'first-use' : 'tls-only' };
       }
       target.drafts[conversation.id] = '';
     });
@@ -586,6 +733,7 @@ export function App() {
     try {
       let sentId: string;
       let toxMessageId: number | undefined;
+      let deferredOtr = false;
       if (source.protocol === 'tox') {
         const friendNumber = Number(contact.remoteId);
         if (!Number.isInteger(friendNumber) || friendNumber < 0) throw new Error('Tox contact is not linked to a toxcore friend');
@@ -624,9 +772,16 @@ export function App() {
               skippedDevices: encrypted.skippedDevices.filter((item) => item.jid === contact.address.split('/')[0]).length || undefined,
             };
           });
+        } else if (provider === 'otr') {
+          if (!contact.resource) throw new Error(languageHint(t, 'OTR требует, чтобы конкретное устройство контакта было в сети.', 'OTR requires a specific contact device to be online.'));
+          const manager = otrManagers.current.get(`${profileId}:${sourceAccountId}`);
+          if (!manager) throw new Error('OTR is not ready; message was not sent');
+          await manager.send(contact.resource, body, pendingId);
+          sentId = pendingId;
+          deferredOtr = true;
         } else sentId = client.sendMessage(contact.address, body);
       }
-      await vault.update((draft) => {
+      if (!deferredOtr) await vault.update((draft) => {
         const message = draft.profiles.find((item) => item.id === profileId)?.messages.find((item) => item.id === pendingId);
         if (message) {
           message.id = sentId;
@@ -751,14 +906,21 @@ export function App() {
     await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === profileId); if (profile) profile.drafts[conversationId] = body; }); refresh();
   };
 
-  const setConversationEncryptionPolicy = async (profileId: string, conversationId: string, policy: 'secure-auto' | 'force-omemo' | 'plaintext') => {
+  const setConversationEncryptionPolicy = async (profileId: string, conversationId: string, policy: 'secure-auto' | 'force-omemo' | 'force-otr' | 'plaintext') => {
+    const snapshot = vault.snapshot.profiles.find((item) => item.id === profileId);
+    const existingConversation = snapshot?.conversations.find((item) => item.id === conversationId);
+    const contact = snapshot?.contacts.find((item) => item.id === existingConversation?.contactId);
+    const accountId = existingConversation?.sourceAccountId ?? (existingConversation ? snapshot?.ui.lastChannelByConversation[existingConversation.id] : undefined);
+    if (existingConversation?.encryption?.provider === 'otr' && policy !== 'force-otr' && contact?.resource && accountId) {
+      await otrManagers.current.get(`${profileId}:${accountId}`)?.end(contact.resource).catch(() => undefined);
+    }
     await vault.update((draft) => {
       const conversation = draft.profiles.find((item) => item.id === profileId)?.conversations.find((item) => item.id === conversationId);
       if (!conversation || conversation.protocol !== 'xmpp') return;
       const previous = conversation.encryption;
       conversation.encryption = {
         policy,
-        provider: policy === 'plaintext' ? 'plaintext' : previous?.provider === 'omemo' ? 'omemo' : 'plaintext',
+        provider: policy === 'plaintext' ? 'plaintext' : policy === 'force-otr' ? 'otr' : previous?.provider === 'omemo' ? 'omemo' : 'plaintext',
         verified: policy !== 'plaintext' && Boolean(previous?.verified),
         devices: previous?.devices ?? [],
         warning: policy === 'plaintext' ? 'tls-only' : previous?.verified ? undefined : 'first-use',
@@ -768,6 +930,13 @@ export function App() {
   };
 
   const deleteConversation = async (profileId: string, conversationId: string) => {
+    const snapshot = vault.snapshot.profiles.find((item) => item.id === profileId);
+    const conversation = snapshot?.conversations.find((item) => item.id === conversationId);
+    const contact = snapshot?.contacts.find((item) => item.id === conversation?.contactId);
+    const accountId = conversation?.sourceAccountId ?? (conversation ? snapshot?.ui.lastChannelByConversation[conversation.id] : undefined);
+    if (conversation?.encryption?.provider === 'otr' && contact?.resource && accountId) {
+      await otrManagers.current.get(`${profileId}:${accountId}`)?.end(contact.resource).catch(() => undefined);
+    }
     await vault.update((draft) => {
       const profile = draft.profiles.find((item) => item.id === profileId); if (!profile) return;
       profile.messages = profile.messages.filter((item) => item.conversationId !== conversationId);
@@ -791,6 +960,7 @@ export function App() {
         const client = toxClients.current.get(`${profileId}:${account.id}`);
         if (client) await client.removeFriend(Number(contact.remoteId));
       } else if (contact.protocol === 'xmpp') {
+        if (contact.resource) await otrManagers.current.get(`${profileId}:${account.id}`)?.end(contact.resource).catch(() => undefined);
         xmppClients.current.get(`${profileId}:${account.id}`)?.removeContact(contact.address);
       }
     } catch (reason) { setError(redactError(reason)); }
@@ -819,6 +989,7 @@ export function App() {
     for (const account of profile.accounts) {
       const key = `${profile.id}:${account.id}`;
       xmppClients.current.get(key)?.stop(); xmppClients.current.delete(key); omemoEngines.current.delete(key); omemoInitializations.current.delete(key);
+      otrManagers.current.get(key)?.close(); otrManagers.current.delete(key); otrInitializations.current.delete(key);
       await toxClients.current.get(key)?.stop().catch(() => undefined); toxClients.current.delete(key);
     }
     await vault.update((draft) => deleteProfile(draft, profile.id));
@@ -840,6 +1011,7 @@ export function App() {
   const disconnectAccount = async (account: Account) => {
     const key = `${data.activeProfileId}:${account.id}`;
     xmppClients.current.get(key)?.stop(); xmppClients.current.delete(key); omemoEngines.current.delete(key); omemoInitializations.current.delete(key);
+    otrManagers.current.get(key)?.close(); otrManagers.current.delete(key); otrInitializations.current.delete(key);
     await toxClients.current.get(key)?.stop(); toxClients.current.delete(key);
     await vault.update((draft) => {
       const current = activeProfile(draft).accounts.find((item) => item.id === account.id);
@@ -862,6 +1034,7 @@ export function App() {
       profile.conversations = profile.conversations.filter((item) => !conversationIds.has(item.id));
       profile.messages = profile.messages.filter((item) => !conversationIds.has(item.conversationId));
       delete profile.omemoAccounts[account.id];
+      delete profile.otrAccounts[account.id];
     });
     refresh();
   };
@@ -932,7 +1105,7 @@ function Unlock({ language, setLanguage, error, unlock }: { language: Language; 
   return <div className="unlock-page"><main className="unlock-box"><div className="language-switch"><button className={language === 'ru' ? 'active' : ''} onClick={() => setLanguage('ru')}>RU</button><button className={language === 'en' ? 'active' : ''} onClick={() => setLanguage('en')}>EN</button></div><div className="unlock-avatar"><LockIcon/></div><h1>{isRu ? 'Введите пароль' : 'Enter password'}</h1><p>{isRu ? 'Чтобы открыть ваши чаты' : 'To open your chats'}</p><form onSubmit={(event) => { event.preventDefault(); void unlock(password, rememberDevice); }}><input autoFocus type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="••••••••••••"/><label className="device-unlock-check"><input type="checkbox" checked={rememberDevice} onChange={(event) => setRememberDevice(event.target.checked)}/><span><strong>{isRu ? 'Запомнить на этом устройстве' : 'Remember on this device'}</strong><small>{isRu ? 'Не спрашивать пароль после обновления страницы' : 'Do not ask after refreshing the page'}</small></span></label><button className="primary" type="submit">{isRu ? 'Открыть' : 'Open'}</button></form>{error && <div className="inline-error">{error}</div>}</main></div>;
 }
 
-function Messenger({ data, scope, selected, onBack, selectConversation, setScreen, sendMessage, retryMessage, setSource, saveDraft, setDeviceTrust, setEncryptionPolicy, deleteConversation, t }: { data: VaultData; scope: ProfileScope; selected?: string; onBack: () => void; selectConversation: (profileId: string, conversationId: string) => Promise<void>; setScreen: (screen: Screen) => void; sendMessage: (profileId: string, conversation: Conversation, body: string, sourceAccountId: string) => Promise<void>; retryMessage: (profileId: string, conversation: Conversation, message: Message) => Promise<void>; setSource: (profileId: string, conversationId: string, accountId: string) => Promise<void>; saveDraft: (profileId: string, conversationId: string, body: string) => Promise<void>; setDeviceTrust: (profileId: string, conversationId: string, deviceId: string, trusted: boolean) => Promise<void>; setEncryptionPolicy: (profileId: string, conversationId: string, policy: 'secure-auto' | 'force-omemo' | 'plaintext') => Promise<void>; deleteConversation: (profileId: string, conversationId: string) => Promise<void>; t: typeof copy[Language] }) {
+function Messenger({ data, scope, selected, onBack, selectConversation, setScreen, sendMessage, retryMessage, setSource, saveDraft, setDeviceTrust, setEncryptionPolicy, deleteConversation, t }: { data: VaultData; scope: ProfileScope; selected?: string; onBack: () => void; selectConversation: (profileId: string, conversationId: string) => Promise<void>; setScreen: (screen: Screen) => void; sendMessage: (profileId: string, conversation: Conversation, body: string, sourceAccountId: string) => Promise<void>; retryMessage: (profileId: string, conversation: Conversation, message: Message) => Promise<void>; setSource: (profileId: string, conversationId: string, accountId: string) => Promise<void>; saveDraft: (profileId: string, conversationId: string, body: string) => Promise<void>; setDeviceTrust: (profileId: string, conversationId: string, deviceId: string, trusted: boolean) => Promise<void>; setEncryptionPolicy: (profileId: string, conversationId: string, policy: 'secure-auto' | 'force-omemo' | 'force-otr' | 'plaintext') => Promise<void>; deleteConversation: (profileId: string, conversationId: string) => Promise<void>; t: typeof copy[Language] }) {
   const [query, setQuery] = useState('');
   const context = useContextMenu<{ profile: LocalProfile; conversation: Conversation }>();
   const profile = activeProfile(data);
@@ -966,7 +1139,7 @@ type ActiveChatProps = {
   setSource: (profileId: string, conversationId: string, accountId: string) => Promise<void>;
   saveDraft: (profileId: string, conversationId: string, body: string) => Promise<void>;
   setDeviceTrust: (profileId: string, conversationId: string, deviceId: string, trusted: boolean) => Promise<void>;
-  setEncryptionPolicy: (profileId: string, conversationId: string, policy: 'secure-auto' | 'force-omemo' | 'plaintext') => Promise<void>;
+  setEncryptionPolicy: (profileId: string, conversationId: string, policy: 'secure-auto' | 'force-omemo' | 'force-otr' | 'plaintext') => Promise<void>;
   t: typeof copy[Language];
 };
 
@@ -976,6 +1149,7 @@ function ActiveChat({ profile, conversation, messages, onBack, send, retry, setS
   const [visibleCount, setVisibleCount] = useState(MESSAGE_RENDER_BATCH);
   const messagesEnd = useRef<HTMLDivElement>(null);
   const securityMenu = useRef<HTMLDivElement>(null);
+  const lastSecurityToggle = useRef(0);
 
   useEffect(() => {
     setBody(profile.drafts[conversation.id] ?? '');
@@ -1003,12 +1177,20 @@ function ActiveChat({ profile, conversation, messages, onBack, send, retry, setS
     ? 'Tox'
     : encryptionPolicy === 'plaintext'
       ? 'TLS'
-      : encryptionPolicy === 'force-omemo' || conversation.encryption?.provider === 'omemo'
+      : encryptionPolicy === 'force-otr' || conversation.encryption?.provider === 'otr'
+        ? 'OTR'
+        : encryptionPolicy === 'force-omemo' || conversation.encryption?.provider === 'omemo'
         ? 'OMEMO'
         : languageHint(t, 'Авто', 'Auto');
-  const chooseEncryption = (policy: 'secure-auto' | 'force-omemo' | 'plaintext') => {
+  const chooseEncryption = (policy: 'secure-auto' | 'force-omemo' | 'force-otr' | 'plaintext') => {
     setSecurityOpen(false);
     void setEncryptionPolicy(profile.id, conversation.id, policy);
+  };
+  const toggleSecurity = () => {
+    const now = performance.now();
+    if (now - lastSecurityToggle.current < 240) return;
+    lastSecurityToggle.current = now;
+    setSecurityOpen((open) => !open);
   };
 
   return (
@@ -1041,7 +1223,7 @@ function ActiveChat({ profile, conversation, messages, onBack, send, retry, setS
             <button
               type="button"
               className={`composer-security ${security.tone}`}
-              onClick={() => setSecurityOpen((open) => !open)}
+              onClick={toggleSecurity}
               aria-expanded={securityOpen}
               aria-haspopup="dialog"
               title={languageHint(t, 'Выбрать шифрование', 'Choose encryption')}
@@ -1055,8 +1237,10 @@ function ActiveChat({ profile, conversation, messages, onBack, send, retry, setS
               <div className="encryption-options">
                 <button type="button" className={encryptionPolicy === 'secure-auto' ? 'active' : ''} onClick={() => chooseEncryption('secure-auto')}><strong>{languageHint(t, 'Авто', 'Auto')}</strong><small>{languageHint(t, 'OMEMO, если доступно', 'OMEMO when available')}</small></button>
                 <button type="button" className={encryptionPolicy === 'force-omemo' ? 'active' : ''} onClick={() => chooseEncryption('force-omemo')}><strong>OMEMO</strong><small>{languageHint(t, 'Только сквозное', 'End-to-end only')}</small></button>
+                <button type="button" className={encryptionPolicy === 'force-otr' ? 'active legacy' : ''} onClick={() => chooseEncryption('force-otr')}><strong>OTR</strong><small>{languageHint(t, 'Для старых клиентов', 'For legacy clients')}</small></button>
                 <button type="button" className={encryptionPolicy === 'plaintext' ? 'active warning' : ''} onClick={() => chooseEncryption('plaintext')}><strong>TLS</strong><small>{languageHint(t, 'Сервер видит текст', 'Server can read text')}</small></button>
               </div>
+              {encryptionPolicy === 'force-otr' && <p className="encryption-caution legacy">{languageHint(t, 'OTR v2/v3 работает с одним онлайн-устройством контакта. Для новых клиентов лучше OMEMO.', 'OTR v2/v3 works with one online contact device. Prefer OMEMO for modern clients.')}</p>}
               {conversation.encryption?.warning === 'stale-device' && <p className="encryption-caution">{languageHint(t, `Пропущено устаревших устройств: ${conversation.encryption.skippedDevices ?? 1}.`, `Skipped stale devices: ${conversation.encryption.skippedDevices ?? 1}.`)}</p>}
               {encryptionPolicy !== 'plaintext' && (
                 <details className="device-details">
@@ -1297,6 +1481,7 @@ async function requestDurableStorage(): Promise<void> {
   try { await navigator.storage?.persist?.(); } catch { /* The browser can safely decline persistent storage. */ }
 }
 function languageHint(t: typeof copy[Language], ru: string, en: string) { return t === copy.ru ? ru : en; }
+function bareAddress(jid: string): string { return jid.split('/', 1)[0] ?? jid; }
 function pluginPermissionLabel(permission: PluginPermission, t: typeof copy[Language]) {
   const labels: Record<PluginPermission, [string, string]> = {
     commands: ['Добавлять команды', 'Add commands'],

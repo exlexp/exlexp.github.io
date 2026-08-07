@@ -55,6 +55,7 @@ export interface Contact {
   alias: string;
   presence: Presence;
   remoteId?: string;
+  resource?: string;
 }
 
 export interface FriendRequest {
@@ -139,6 +140,13 @@ export interface OmemoAccountState {
   legacyStore?: Record<string, OmemoStoredValue>;
 }
 
+export interface OtrAccountState {
+  version: 1;
+  privateKey: string;
+  instanceTag: string;
+  fingerprint: string;
+}
+
 export interface LocalProfile {
   id: string;
   name: string;
@@ -160,6 +168,7 @@ export interface LocalProfile {
   settings: ProfileSettings;
   ui: ProfileUiState;
   omemoAccounts: Record<string, OmemoAccountState>;
+  otrAccounts: Record<string, OtrAccountState>;
 }
 
 export interface VaultSettings {
@@ -211,6 +220,7 @@ export function createLocalProfile(name: string, order: number, ephemeral = fals
     },
     ui: { lastChannelByConversation: {}, lastActiveAt: Date.now() },
     omemoAccounts: {},
+    otrAccounts: {},
   };
 }
 

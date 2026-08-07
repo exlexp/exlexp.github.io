@@ -37,6 +37,35 @@ describe('XMPP client contact flow', () => {
     expect(sent[0]).not.toContain('no-store');
   });
 
+  it('routes OTR only to a full JID and disables server-side copies', () => {
+    const sent: string[] = [];
+    const client = new XmppClient();
+    const harness = client as unknown as { bound: boolean; socket: { readyState: number; send(value: string): void } };
+    harness.bound = true;
+    harness.socket = { readyState: WebSocket.OPEN, send: (value) => sent.push(value) };
+    expect(() => client.sendOtrMessage('friend@example.org', '?OTRv23?')).toThrow(/specific online XMPP resource/i);
+    client.sendOtrMessage('friend@example.org/dino', '?OTRv23?');
+    expect(sent[0]).toContain('to="friend@example.org/dino"');
+    expect(sent[0]).toContain('namespace="urn:xmpp:otr:0"');
+    expect(sent[0]).toContain('<no-copy');
+    expect(sent[0]).toContain('<no-permanent-store');
+    expect(sent[0]).toContain('<private');
+    expect(sent[0]).not.toContain('<request');
+  });
+
+  it('separates incoming OTR protocol frames from visible chat messages', async () => {
+    const client = new XmppClient();
+    const events: unknown[] = [];
+    client.subscribe((event) => events.push(event));
+    const harness = client as unknown as { handleFrame(xml: string): Promise<void> };
+    await harness.handleFrame('<message from="friend@example.org/dino" to="me@example.org/relayless" type="chat" id="otr-1"><body>?OTRv23?</body></message>');
+    expect(events).toContainEqual({
+      type: 'otr-wire', id: 'otr-1', from: 'friend@example.org', peer: 'friend@example.org/dino',
+      body: '?OTRv23?', timestamp: expect.any(Number),
+    });
+    expect(events).not.toContainEqual(expect.objectContaining({ type: 'message', id: 'otr-1' }));
+  });
+
   it('marks OMEMO 2 messages for interoperable encryption discovery', () => {
     const sent: string[] = [];
     const client = new XmppClient();

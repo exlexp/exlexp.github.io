@@ -178,25 +178,30 @@ button.security-state { border: 0; font: inherit; cursor: pointer; }
 .composer textarea { min-height: 44px; max-height: 130px; padding: 11px 14px; resize: none; border: 0; border-radius: 22px; background: var(--chat-search); line-height: 22px; }
 .composer > .send-message { width: 44px; height: 44px; flex: 0 0 auto; display: grid; place-content: center; border: 0; border-radius: 50%; background: var(--chat-blue); color: #fff; cursor: pointer; }
 .composer > .send-message:disabled { opacity: .45; cursor: default; }
-.composer-security-wrap { position: relative; flex: 0 0 auto; }
-.composer-security { width: 76px; height: 36px; padding: 0 10px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 0; border-radius: 18px; background: #edf2f5; color: #64727e; font-size: 11px; font-weight: 700; cursor: default; white-space: nowrap; }
-button.composer-security { cursor: pointer; }
-.composer-security:hover, .composer-security[aria-expanded="true"] { background: #e5edf3; color: #43525e; }
-.composer-security.secure { background: #eaf7ee; color: #2f8555; }
-.composer-security.warning { background: #fff4e2; color: #8b611f; }
+.composer-security-wrap { position: relative; flex: 0 0 auto; isolation: isolate; }
+.composer-security { min-width: 84px; width: auto; height: 38px; padding: 0 14px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; border: 1px solid transparent; border-radius: 20px; background: #edf2f5; color: #4e5f6c; font-size: 11px; font-weight: 720; letter-spacing: .01em; cursor: default; white-space: nowrap; transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, box-shadow 140ms ease; }
+button.composer-security { cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.composer .composer-security:hover, .composer .composer-security[aria-expanded="true"] { background: #e6edf2; color: #344651; box-shadow: 0 2px 8px rgba(36, 54, 68, .08); transform: none; }
+.composer .composer-security.secure { border-color: #d4ecdd; background: #eaf7ee; color: #267947; }
+.composer .composer-security.secure:hover, .composer .composer-security.secure[aria-expanded="true"] { border-color: #c4e4d0; background: #dff2e6; color: #176d3b; }
+.composer .composer-security.warning { border-color: #f1dfbf; background: #fff4e2; color: #825814; }
+.composer .composer-security.warning:hover, .composer .composer-security.warning[aria-expanded="true"] { background: #fbeacc; color: #72490b; }
 .composer-security svg { width: 14px; height: 14px; flex: 0 0 auto; }
-.security-popover { position: absolute; z-index: 20; bottom: calc(100% + 10px); left: 0; width: min(330px, calc(100vw - 88px)); padding: 10px; border: 1px solid rgba(43, 64, 82, .12); border-radius: 14px; background: #fff; box-shadow: 0 12px 34px rgba(30, 49, 64, .18); }
-.security-popover::after { content: ""; position: absolute; left: 27px; bottom: -5px; width: 10px; height: 10px; border-right: 1px solid rgba(43, 64, 82, .12); border-bottom: 1px solid rgba(43, 64, 82, .12); background: #fff; transform: rotate(45deg); }
-.security-popover-title { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 2px 3px 9px; }
-.security-popover-title strong { font-size: 13px; }
-.security-popover-title small { color: var(--chat-muted); font-size: 10px; }
-.encryption-options { display: grid; gap: 3px; }
-.encryption-options > button { width: 100%; min-height: 44px; padding: 7px 10px; display: grid; grid-template-columns: 72px minmax(0, 1fr); align-items: center; gap: 8px; border: 0; border-radius: 9px; background: transparent; color: #334350; text-align: left; cursor: pointer; }
-.encryption-options > button:hover { background: #f3f6f8; }
-.encryption-options > button.active { background: var(--chat-blue-soft); color: var(--chat-blue); }
-.encryption-options > button.active.warning { background: #fff4e2; color: #8b611f; }
-.encryption-options strong { font-size: 12px; }
-.encryption-options small { color: var(--chat-muted); font-size: 11px; }
+.security-popover { position: absolute; z-index: 20; bottom: calc(100% + 12px); left: 0; width: min(366px, calc(100vw - 28px)); padding: 14px; border: 1px solid rgba(43, 64, 82, .11); border-radius: 17px; background: #fff; box-shadow: 0 16px 42px rgba(30, 49, 64, .17); }
+.security-popover::after { content: ""; position: absolute; left: 29px; bottom: -6px; width: 11px; height: 11px; border-right: 1px solid rgba(43, 64, 82, .11); border-bottom: 1px solid rgba(43, 64, 82, .11); background: #fff; transform: rotate(45deg); }
+.security-popover-title { display: flex; align-items: baseline; justify-content: space-between; gap: 18px; padding: 1px 4px 12px; }
+.security-popover-title strong { color: #283944; font-size: 13px; }
+.security-popover-title small { color: #788792; font-size: 10px; }
+.encryption-options { display: grid; gap: 5px; }
+.composer .security-popover .encryption-options > button { width: 100%; min-height: 52px; padding: 9px 12px; display: grid; grid-template-columns: 86px minmax(0, 1fr); align-items: center; gap: 10px; border: 1px solid transparent; border-radius: 12px; background: transparent; color: #334651; text-align: left; cursor: pointer; box-shadow: none; transform: none; transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease; }
+.composer .security-popover .encryption-options > button:hover { background: #f3f7f9; color: #283b47; }
+.composer .security-popover .encryption-options > button.active { border-color: #d8e9f8; background: #edf6ff; color: #237bc4; }
+.composer .security-popover .encryption-options > button.active:hover { background: #e6f2fc; color: #176eaf; }
+.composer .security-popover .encryption-options > button.active.legacy { border-color: #d6eadf; background: #edf8f1; color: #277a4b; }
+.composer .security-popover .encryption-options > button.active.warning { border-color: #f0dfc1; background: #fff6e7; color: #825814; }
+.encryption-options strong { font-size: 12px; line-height: 1.2; }
+.encryption-options small { color: #687984; font-size: 11px; line-height: 1.35; }
+.encryption-caution.legacy { border-color: #d9eadf; background: #f3faf5; color: #46705a; }
 .device-details { margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--chat-line); }
 .device-details summary { padding: 5px 3px; color: #53616d; font-size: 11px; font-weight: 650; cursor: pointer; }
 .device-list { max-height: 190px; overflow: auto; }

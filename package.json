@@ -32,6 +32,8 @@
     "idb": "8.0.3",
     "libomemo.js": "3.0.0",
     "lucide-react": "1.30.0",
+    "otr": "0.2.16",
+    "path-browserify": "1.0.1",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "simple-icons": "16.28.0"
@@ -42,6 +44,7 @@
     "@testing-library/react": "16.3.2",
     "@types/jsdom": "30.0.0",
     "@types/node": "26.2.0",
+    "@types/path-browserify": "1.0.3",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.4",
     "@vitejs/plugin-react": "6.0.5",

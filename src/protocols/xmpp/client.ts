@@ -18,11 +18,12 @@ export type XmppOmemoNamespace = 'urn:xmpp:omemo:2' | 'eu.siacs.conversations.ax
 
 export type XmppEvent =
   | { type: 'state'; state: XmppState; detail?: string }
-  | { type: 'message'; id: string; from: string; body: string; timestamp: number; direction: 'incoming' | 'outgoing'; archived?: boolean }
+  | { type: 'message'; id: string; from: string; peer: string; body: string; timestamp: number; direction: 'incoming' | 'outgoing'; archived?: boolean }
+  | { type: 'otr-wire'; id: string; from: string; peer: string; body: string; timestamp: number }
   | { type: 'encrypted-message'; id: string; from: string; timestamp: number; archived?: boolean; payload: XmppOmemoPayload }
   | { type: 'receipt'; id: string; from: string }
   | { type: 'message-error'; id: string; from: string; detail: string }
-  | { type: 'presence'; from: string; show: string }
+  | { type: 'presence'; from: string; peer: string; show: string }
   | { type: 'chat-state'; from: string; state: 'active' | 'composing' | 'paused' | 'inactive' | 'gone' }
   | { type: 'omemo-devices'; from: string; namespace: XmppOmemoNamespace; deviceIds: number[] }
   | { type: 'roster'; contacts: Array<{ jid: string; name: string }> };
@@ -140,6 +141,29 @@ export class XmppClient {
     return id;
   }
 
+  sendOtrMessage(to: string, body: string, requestReceipt = false): string {
+    if (!this.bound || this.socket?.readyState !== WebSocket.OPEN) throw new Error('XMPP account is offline');
+    if (!to.includes('/')) throw new Error('OTR requires a specific online XMPP resource');
+    if (!isOtrWireBody(body) || utf8(body).byteLength > 64 * 1024) throw new Error('Invalid OTR wire message');
+    const id = crypto.randomUUID();
+    this.send(
+      `<message to="${escapeXml(to)}" type="chat" id="${id}">` +
+        `<body>${escapeXml(body)}</body>` +
+        `<encryption xmlns="urn:xmpp:eme:0" namespace="urn:xmpp:otr:0"/>` +
+        `<no-copy xmlns="urn:xmpp:hints"/>` +
+        `<no-permanent-store xmlns="urn:xmpp:hints"/>` +
+        `<private xmlns="urn:xmpp:carbons:2"/>` +
+        (requestReceipt ? '<request xmlns="urn:xmpp:receipts"/>' : '') +
+      `</message>`,
+    );
+    return id;
+  }
+
+  sendReceipt(to: string, id: string): void {
+    if (!this.bound || this.socket?.readyState !== WebSocket.OPEN || !to || !id) return;
+    this.send(`<message to="${escapeXml(to)}"><received xmlns="urn:xmpp:receipts" id="${escapeXml(id)}"/></message>`);
+  }
+
   sendMessage(to: string, body: string): string {
     if (!this.bound || this.socket?.readyState !== WebSocket.OPEN) throw new Error('XMPP account is offline');
     if (utf8(body).byteLength > 64 * 1024) throw new Error('Message exceeds the 64 KiB safety limit');
@@ -247,13 +271,15 @@ export class XmppClient {
         case 'message':
           this.handleMessage(element);
           break;
-        case 'presence':
+        case 'presence': {
+          const peer = element.getAttribute('from') ?? '';
           this.emit({
             type: 'presence',
-            from: bareJid(element.getAttribute('from') ?? ''),
+            from: bareJid(peer), peer,
             show: textOf(element, 'show') ?? (element.getAttribute('type') === 'unavailable' ? 'offline' : 'online'),
           });
           break;
+        }
         case 'enabled':
           this.stream.enable(element.getAttribute('id') ?? '', element.getAttribute('resume') === 'true');
           this.finishOnline();
@@ -426,11 +452,20 @@ export class XmppClient {
     const body = textOf(message, 'body');
     if (body === undefined) return undefined;
     const id = stableMessageId(message);
-    const from = bareJid(message.getAttribute('from') ?? '');
-    const to = bareJid(message.getAttribute('to') ?? '');
+    const fullFrom = message.getAttribute('from') ?? '';
+    const fullTo = message.getAttribute('to') ?? '';
+    const from = bareJid(fullFrom);
+    const to = bareJid(fullTo);
     const own = bareJid(this.credentials?.jid ?? '');
     const direction = from === own ? 'outgoing' : 'incoming';
-    this.emit({ type: 'message', id, from: direction === 'outgoing' ? to : from, body, timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(), direction, archived });
+    const peer = direction === 'outgoing' ? fullTo : fullFrom;
+    if (!archived && direction === 'incoming' && isOtrWireBody(body)) {
+      this.emit({ type: 'otr-wire', id, from, peer, body, timestamp: Number.isFinite(timestamp) ? timestamp : Date.now() });
+      if (body.startsWith('?OTR')) return undefined;
+    }
+    const visibleBody = stripOtrWhitespaceTag(body);
+    if (!visibleBody) return undefined;
+    this.emit({ type: 'message', id, from: direction === 'outgoing' ? to : from, peer, body: visibleBody, timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(), direction, archived });
     return id;
   }
 
@@ -508,6 +543,17 @@ function parseJid(jid: string): { local: string; domain: string } {
 
 function bareJid(jid: string): string {
   return jid.split('/')[0] ?? jid;
+}
+
+const OTR_WHITESPACE_TAG = ' \t  \t\t\t\t \t \t \t  ';
+
+function isOtrWireBody(body: string): boolean {
+  return body.startsWith('?OTR') || body.includes(OTR_WHITESPACE_TAG);
+}
+
+function stripOtrWhitespaceTag(body: string): string {
+  const index = body.indexOf(OTR_WHITESPACE_TAG);
+  return (index < 0 ? body : body.slice(0, index)).trimEnd();
 }
 
 function stableMessageId(message: Element): string {
