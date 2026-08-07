@@ -19,6 +19,7 @@ import { ProfileRail, type ProfileScope } from './ProfileRail';
 import { PlaintextConfirmationRequired, resolveEncryptionProvider } from '../encryption/provider';
 import { requestLocalNotifications, showLocalMessageNotification } from './notifications';
 import { XmppAccountSetup } from './XmppAccountSetup';
+import type { OmemoEngine } from '../encryption/omemo';
 
 type Screen = 'chats' | 'accounts' | 'contacts' | 'privacy' | 'plugins' | 'settings';
 type Gate = 'loading' | 'launch' | 'unlock' | 'open';
@@ -41,6 +42,8 @@ export function App() {
   const [profileScope, setProfileScope] = useState<ProfileScope>('all');
   const [paletteOpen, setPaletteOpen] = useState(false);
   const xmppClients = useRef(new Map<string, XmppClient>());
+  const omemoEngines = useRef(new Map<string, OmemoEngine>());
+  const omemoInitializations = useRef(new Map<string, Promise<OmemoEngine>>());
   const toxClients = useRef(new Map<string, ToxClient>());
   const toxSavedata = useRef(new Map<string, string>());
   const viewState = useRef<{ activeProfileId?: string; screen: Screen; conversationId?: string }>({ screen: 'chats' });
@@ -64,6 +67,7 @@ export function App() {
 
   useEffect(() => () => {
     for (const client of xmppClients.current.values()) client.stop();
+    omemoEngines.current.clear(); omemoInitializations.current.clear();
     for (const client of toxClients.current.values()) void client.stop();
   }, []);
 
@@ -140,7 +144,7 @@ export function App() {
   async function lock() {
     for (const client of xmppClients.current.values()) client.stop();
     for (const client of toxClients.current.values()) void client.stop();
-    xmppClients.current.clear(); toxClients.current.clear();
+    xmppClients.current.clear(); omemoEngines.current.clear(); omemoInitializations.current.clear(); toxClients.current.clear();
     await vault.disableDeviceUnlock().catch(() => undefined);
     vault.lock(); setData(undefined); setGate('unlock');
   }
@@ -168,7 +172,7 @@ export function App() {
     });
     for (const accountId of stopAccountIds) {
       const key = `${previousId}:${accountId}`;
-      xmppClients.current.get(key)?.stop(); xmppClients.current.delete(key);
+      xmppClients.current.get(key)?.stop(); xmppClients.current.delete(key); omemoEngines.current.delete(key); omemoInitializations.current.delete(key);
       void toxClients.current.get(key)?.stop(); toxClients.current.delete(key);
     }
     refresh(); setProfileScope(profileId); setSelectedConversation(target.ui.lastConversationId); setScreen('chats');
@@ -193,7 +197,7 @@ export function App() {
     const key = `${profileId}:${account.id}`;
     const existing = xmppClients.current.get(key);
     if (existing && account.connectionState !== 'error') return;
-    if (existing) { existing.stop(); xmppClients.current.delete(key); }
+    if (existing) { existing.stop(); xmppClients.current.delete(key); omemoEngines.current.delete(key); omemoInitializations.current.delete(key); }
     const client = new XmppClient();
     client.subscribe((event) => {
       if (event.type === 'state') {
@@ -206,7 +210,10 @@ export function App() {
             current.connectionState = event.state;
             current.connectionDetail = event.detail;
           }
-        }).then(refresh);
+        }).then(() => {
+          refresh();
+          if (event.state === 'online') void initializeOmemo(client, account, profileId).catch((reason) => setError(redactError(reason)));
+        });
       }
       if (event.type === 'roster') {
         void vault.update((draft) => {
@@ -247,12 +254,88 @@ export function App() {
           profile.messages.push({ id: event.id, conversationId: conversation.id, direction: 'incoming', body: event.body, timestamp: event.timestamp, delivery: 'delivered', sourceAccountId: account.id, encryptionProvider: 'plaintext' });
         }).then(() => { refresh(); if (shouldNotify) showLocalMessageNotification(profileName, conversationTitle, event.body, vault.snapshot.settings.showNotificationPreviews); });
       }
+      if (event.type === 'encrypted-message') {
+        void (async () => {
+          try {
+            const engine = omemoEngines.current.get(key) ?? await initializeOmemo(client, account, profileId);
+            const decrypted = await engine.decrypt(event.from, event.payload);
+            const profileName = vault.snapshot.profiles.find((item) => item.id === profileId)?.name ?? 'Relayless';
+            let shouldNotify = false;
+            let conversationTitle = event.from;
+            await vault.update((draft) => {
+              const profile = draft.profiles.find((item) => item.id === profileId); if (!profile) return;
+              if (profile.messages.some((item) => item.id === event.id)) return;
+              let contact = profile.contacts.find((item) => item.accountId === account.id && item.address === event.from);
+              if (!contact) {
+                contact = { id: crypto.randomUUID(), accountId: account.id, protocol: 'xmpp', address: event.from, alias: event.from, presence: 'offline' };
+                profile.contacts.push(contact);
+              }
+              let conversation = profile.conversations.find((item) => item.contactId === contact.id);
+              const remoteDeviceId = String(event.payload.senderDeviceId);
+              const deviceId = `${event.from}:${remoteDeviceId}`;
+              const device = { id: deviceId, label: `XMPP ${remoteDeviceId}`, fingerprint: decrypted.fingerprint, trust: 'untrusted' as const, firstSeenAt: Date.now() };
+              if (!conversation) {
+                conversation = { id: crypto.randomUUID(), contactId: contact.id, protocol: 'xmpp', title: contact.alias, unread: 0, updatedAt: event.timestamp, sourceAccountId: account.id, encryption: { policy: 'secure-auto', provider: 'omemo', verified: false, devices: [device], warning: 'first-use' } };
+                profile.conversations.push(conversation);
+              } else {
+                const existingDevice = conversation.encryption?.devices.find((item) => item.id === deviceId);
+                const changed = Boolean(existingDevice && existingDevice.fingerprint !== decrypted.fingerprint);
+                conversation.encryption = {
+                  policy: conversation.encryption?.policy ?? 'secure-auto', provider: 'omemo',
+                  verified: Boolean(existingDevice?.trust === 'trusted' && !changed),
+                  devices: changed
+                    ? [...(conversation.encryption?.devices.filter((item) => item.id !== deviceId) ?? []), { ...device, changedAt: Date.now() }]
+                    : existingDevice ? conversation.encryption!.devices : [...(conversation.encryption?.devices ?? []), device],
+                  warning: changed ? 'changed-device' : existingDevice?.trust === 'trusted' ? undefined : 'first-use',
+                };
+              }
+              const visible = viewState.current.activeProfileId === profileId && viewState.current.screen === 'chats' && viewState.current.conversationId === conversation.id;
+              recordIncomingActivity(conversation, visible, event.timestamp);
+              conversationTitle = conversation.title; shouldNotify = !visible;
+              profile.messages.push({ id: event.id, conversationId: conversation.id, direction: 'incoming', body: decrypted.body, timestamp: event.timestamp, delivery: 'delivered', sourceAccountId: account.id, encryptionProvider: 'omemo' });
+            });
+            refresh();
+            if (shouldNotify) showLocalMessageNotification(profileName, conversationTitle, decrypted.body, vault.snapshot.settings.showNotificationPreviews);
+          } catch (reason) { setError(redactError(reason)); }
+        })();
+      }
       if (event.type === 'receipt') {
         void vault.update((draft) => { const message = draft.profiles.find((profile) => profile.id === profileId)?.messages.find((item) => item.id === event.id); if (message) message.delivery = 'delivered'; }).then(refresh);
       }
     });
     xmppClients.current.set(key, client);
     void client.start({ jid: account.address, password: account.secret, endpoint: account.endpoint, restoreArchive: account.mamEnabled }).catch((reason) => setError(redactError(reason)));
+  };
+
+  const initializeOmemo = async (client: XmppClient, account: Account, profileId: string): Promise<OmemoEngine> => {
+    const key = `${profileId}:${account.id}`;
+    const existing = omemoEngines.current.get(key);
+    if (existing) return existing;
+    const pending = omemoInitializations.current.get(key);
+    if (pending) return pending;
+    const initialization = (async () => {
+      const saved = vault.snapshot.profiles.find((item) => item.id === profileId)?.omemoAccounts[account.id];
+      const { OmemoEngine: Engine } = await import('../encryption/omemo');
+      const engine = await Engine.open(client, account.address, saved, async (state) => {
+        await vault.update((draft) => {
+          const profile = draft.profiles.find((item) => item.id === profileId);
+          if (profile) profile.omemoAccounts[account.id] = state;
+        });
+      });
+      omemoEngines.current.set(key, engine);
+      try { await engine.announce(); }
+      catch (reason) {
+        omemoEngines.current.delete(key);
+        client.setOmemoDeviceId(undefined);
+        throw new Error(`OMEMO could not be enabled: ${redactError(reason)}`, { cause: reason });
+      }
+      return engine;
+    })();
+    omemoInitializations.current.set(key, initialization);
+    try { return await initialization; }
+    finally {
+      if (omemoInitializations.current.get(key) === initialization) omemoInitializations.current.delete(key);
+    }
   };
 
   const addTox = async (alias: string, savedata?: string) => {
@@ -472,8 +555,9 @@ export function App() {
     validateOutgoingMessage(conversation.protocol, body, t);
     let provider: 'tox' | 'plaintext' | 'omemo' | 'otr' = source.protocol === 'tox' ? 'tox' : 'plaintext';
     if (source.protocol === 'xmpp') {
+      const omemoAvailable = omemoEngines.current.has(`${profileId}:${sourceAccountId}`);
       try {
-        provider = resolveEncryptionProvider(conversation.encryption?.policy ?? profile.settings.defaultEncryptionPolicy, { omemo: false, otr: false }) as 'plaintext' | 'omemo' | 'otr';
+        provider = resolveEncryptionProvider(conversation.encryption?.policy ?? profile.settings.defaultEncryptionPolicy, { omemo: omemoAvailable, otr: false }) as 'plaintext' | 'omemo' | 'otr';
       } catch (reason) {
         if (!(reason instanceof PlaintextConfirmationRequired) || !window.confirm(languageHint(t, 'OMEMO/OTR недоступен. Отправить это сообщение через XMPP с защитой только TLS?', 'OMEMO/OTR is unavailable. Send this message over TLS-only XMPP?'))) throw reason;
         provider = 'plaintext';
@@ -490,7 +574,7 @@ export function App() {
         current.sourceAccountId = sourceAccountId;
         current.encryption = provider === 'tox'
           ? { policy: 'secure-auto', provider: 'tox', verified: true, devices: [] }
-          : { policy: current.encryption?.policy ?? target.settings.defaultEncryptionPolicy, provider, verified: false, devices: current.encryption?.devices ?? [], warning: 'tls-only' };
+          : { policy: current.encryption?.policy ?? target.settings.defaultEncryptionPolicy, provider, verified: false, devices: current.encryption?.devices ?? [], warning: provider === 'omemo' ? 'first-use' : 'tls-only' };
       }
       target.drafts[conversation.id] = '';
     });
@@ -512,7 +596,28 @@ export function App() {
       } else {
         const client = xmppClients.current.get(`${profileId}:${sourceAccountId}`);
         if (!client) throw new Error(languageHint(t, 'Сначала подключите XMPP-аккаунт.', 'Connect the XMPP account first.'));
-        sentId = client.sendMessage(contact.address, body);
+        if (provider === 'omemo') {
+          const engine = omemoEngines.current.get(`${profileId}:${sourceAccountId}`);
+          if (!engine) throw new Error('OMEMO is not ready; message was not sent');
+          const encrypted = await engine.encrypt(contact.address, body);
+          sentId = client.sendEncryptedMessage(contact.address, encrypted.xml);
+          await vault.update((draft) => {
+            const current = draft.profiles.find((item) => item.id === profileId)?.conversations.find((item) => item.id === conversation.id);
+            if (!current) return;
+            const previous = current.encryption?.devices ?? [];
+            const recipientDevices = encrypted.devices.filter((item) => item.jid === contact.address.split('/')[0]);
+            const devices = recipientDevices.map((item) => ({
+                id: `${item.jid}:${item.deviceId}`, label: `XMPP ${item.deviceId}`, fingerprint: item.fingerprint,
+                trust: previous.find((known) => known.fingerprint === item.fingerprint)?.trust ?? 'untrusted', firstSeenAt: Date.now(),
+              }));
+            const verified = devices.length > 0 && devices.every((item) => item.trust === 'trusted');
+            current.encryption = {
+              policy: current.encryption?.policy ?? 'secure-auto', provider: 'omemo', verified,
+              devices,
+              warning: verified ? undefined : 'first-use',
+            };
+          });
+        } else sentId = client.sendMessage(contact.address, body);
       }
       await vault.update((draft) => {
         const message = draft.profiles.find((item) => item.id === profileId)?.messages.find((item) => item.id === pendingId);
@@ -603,9 +708,21 @@ export function App() {
     await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === profileId); if (profile) profile.drafts[conversationId] = body; }); refresh();
   };
 
+  const setConversationDeviceTrust = async (profileId: string, conversationId: string, deviceId: string, trusted: boolean) => {
+    await vault.update((draft) => {
+      const conversation = draft.profiles.find((item) => item.id === profileId)?.conversations.find((item) => item.id === conversationId);
+      const device = conversation?.encryption?.devices.find((item) => item.id === deviceId);
+      if (!conversation?.encryption || !device) throw new Error('Encryption device is no longer available');
+      device.trust = trusted ? 'trusted' : 'untrusted';
+      conversation.encryption.verified = conversation.encryption.devices.length > 0 && conversation.encryption.devices.every((item) => item.trust === 'trusted');
+      conversation.encryption.warning = conversation.encryption.verified ? undefined : device.changedAt ? 'changed-device' : 'first-use';
+    });
+    refresh();
+  };
+
   const disconnectAccount = async (account: Account) => {
     const key = `${data.activeProfileId}:${account.id}`;
-    xmppClients.current.get(key)?.stop(); xmppClients.current.delete(key);
+    xmppClients.current.get(key)?.stop(); xmppClients.current.delete(key); omemoEngines.current.delete(key); omemoInitializations.current.delete(key);
     await toxClients.current.get(key)?.stop(); toxClients.current.delete(key);
     await vault.update((draft) => {
       const current = activeProfile(draft).accounts.find((item) => item.id === account.id);
@@ -615,6 +732,8 @@ export function App() {
   };
 
   const removeAccount = async (account: Account) => {
+    const engine = omemoEngines.current.get(`${data.activeProfileId}:${account.id}`);
+    if (engine) await engine.revoke().catch((reason) => setError(redactError(reason)));
     await disconnectAccount(account);
     await vault.update((draft) => {
       const profile = activeProfile(draft);
@@ -625,6 +744,7 @@ export function App() {
       profile.friendRequests = profile.friendRequests.filter((item) => item.accountId !== account.id);
       profile.conversations = profile.conversations.filter((item) => !conversationIds.has(item.id));
       profile.messages = profile.messages.filter((item) => !conversationIds.has(item.conversationId));
+      delete profile.omemoAccounts[account.id];
     });
     refresh();
   };
@@ -643,12 +763,12 @@ export function App() {
         </aside>
         <main className="workspace">
           <WorkspaceErrorBoundary resetKey={`${screen}:${currentProfile.id}`} language={language}>
-          {screen === 'chats' && <Messenger data={data} scope={profileScope} selected={selectedConversation} onBack={() => setSelectedConversation(undefined)} selectConversation={selectConversation} setScreen={setScreen} sendMessage={sendMessage} setSource={setConversationSource} saveDraft={saveDraft} t={t}/>} 
+          {screen === 'chats' && <Messenger data={data} scope={profileScope} selected={selectedConversation} onBack={() => setSelectedConversation(undefined)} selectConversation={selectConversation} setScreen={setScreen} sendMessage={sendMessage} setSource={setConversationSource} saveDraft={saveDraft} setDeviceTrust={setConversationDeviceTrust} t={t}/>}
           {screen === 'accounts' && <Accounts profile={currentProfile} addXmpp={addXmpp} connectXmpp={(account) => connectXmpp(account, currentProfile.id)} addTox={addTox} connectTox={(account) => connectTox(account, currentProfile.id)} disconnectAccount={disconnectAccount} removeAccount={removeAccount} exportAccount={async (account) => { try { let exportPassword: string | undefined; if (!vault.isPersistent) { exportPassword = window.prompt(languageHint(t, 'Придумайте пароль для зашифрованной копии (минимум 10 символов)', 'Create a password for the encrypted backup (at least 10 characters)'))?.trim(); if (!exportPassword) return; } downloadText(await vault.exportAccount(currentProfile.id, account.id, exportPassword), `${safeFilename(account.alias)}.rlaccount`); } catch (reason) { setError(redactError(reason)); } }} t={t}/>}
           {screen === 'contacts' && <Contacts profile={currentProfile} acceptToxFriend={acceptToxFriend} rejectToxFriend={rejectToxFriend} addXmppContact={addXmppContact} addToxFriend={addToxFriend} openContact={openContact} renameContact={renameContact} goToAccounts={() => setScreen('accounts')} t={t}/>}
           {screen === 'privacy' && <Privacy data={data} profile={currentProfile} network={network} t={t} onLock={() => void lock()} onWipe={async () => { await vault.wipe(); setData(undefined); setGate('launch'); }} onExport={async () => downloadText(await vault.exportEncrypted(), 'relayless-vault.rlvault')}/>}
-          {screen === 'plugins' && <Plugins data={data} t={t} onInstall={async (source, granted) => { const manifest = parsePluginManifest(source); await vault.update((draft) => { draft.plugins = installPlugin(manifest, granted, draft.plugins); }); refresh(); }} onToggle={async (id) => { await vault.update((draft) => { const plugin = draft.plugins.find((item) => item.manifest.id === id); if (plugin) plugin.enabled = !plugin.enabled; }); refresh(); }} onRemove={async (id) => { await vault.update((draft) => { draft.plugins = draft.plugins.filter((item) => item.manifest.id !== id); }); refresh(); }}/>} 
-          {screen === 'settings' && <Settings data={data} profile={currentProfile} t={t} onSave={updateSettings} onProfileUpdate={async (settings) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.settings = settings; }); refresh(); }} onRename={async (name) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) { profile.name = name; profile.initials = name.slice(0, 2).toUpperCase(); } }); refresh(); }} onPin={async () => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.pinned = !profile.pinned; }); refresh(); }} onAvatar={async (avatar) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.avatar = avatar; }); refresh(); }} onLockProfile={async () => { for (const account of currentProfile.accounts) { const key = `${currentProfile.id}:${account.id}`; xmppClients.current.get(key)?.stop(); xmppClients.current.delete(key); void toxClients.current.get(key)?.stop(); toxClients.current.delete(key); } await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) { profile.locked = true; profile.runtimeState = 'locked'; } }); refresh(); setProfileScope('all'); setSelectedConversation(undefined); setScreen('chats'); }} onDuplicate={async () => { await vault.update((draft) => duplicateProfileSettings(draft, currentProfile.id, `${currentProfile.name} copy`)); refresh(); }} onEphemeral={() => void createNewProfile(true)} onDelete={async () => { for (const account of currentProfile.accounts) { const key = `${currentProfile.id}:${account.id}`; xmppClients.current.get(key)?.stop(); void toxClients.current.get(key)?.stop(); } await vault.update((draft) => deleteProfile(draft, currentProfile.id)); refresh(); }} onExportProfile={async () => downloadText(await vault.exportProfile(currentProfile.id), `${safeFilename(currentProfile.name)}.rlprofile`)} onImportProfile={async (text) => { const id = await vault.importProfile(text); refresh(); await selectProfile(id); }}/>} 
+          {screen === 'plugins' && <Plugins data={data} t={t} onInstall={async (source, granted) => { const manifest = parsePluginManifest(source); await vault.update((draft) => { draft.plugins = installPlugin(manifest, granted, draft.plugins); }); refresh(); }} onToggle={async (id) => { await vault.update((draft) => { const plugin = draft.plugins.find((item) => item.manifest.id === id); if (plugin) plugin.enabled = !plugin.enabled; }); refresh(); }} onRemove={async (id) => { await vault.update((draft) => { draft.plugins = draft.plugins.filter((item) => item.manifest.id !== id); }); refresh(); }}/>}
+          {screen === 'settings' && <Settings data={data} profile={currentProfile} t={t} onSave={updateSettings} onProfileUpdate={async (settings) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.settings = settings; }); refresh(); }} onRename={async (name) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) { profile.name = name; profile.initials = name.slice(0, 2).toUpperCase(); } }); refresh(); }} onPin={async () => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.pinned = !profile.pinned; }); refresh(); }} onAvatar={async (avatar) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.avatar = avatar; }); refresh(); }} onLockProfile={async () => { for (const account of currentProfile.accounts) { const key = `${currentProfile.id}:${account.id}`; xmppClients.current.get(key)?.stop(); xmppClients.current.delete(key); omemoEngines.current.delete(key); void toxClients.current.get(key)?.stop(); toxClients.current.delete(key); } await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) { profile.locked = true; profile.runtimeState = 'locked'; } }); refresh(); setProfileScope('all'); setSelectedConversation(undefined); setScreen('chats'); }} onDuplicate={async () => { await vault.update((draft) => duplicateProfileSettings(draft, currentProfile.id, `${currentProfile.name} copy`)); refresh(); }} onEphemeral={() => void createNewProfile(true)} onDelete={async () => { for (const account of currentProfile.accounts) { const key = `${currentProfile.id}:${account.id}`; xmppClients.current.get(key)?.stop(); omemoEngines.current.delete(key); void toxClients.current.get(key)?.stop(); } await vault.update((draft) => deleteProfile(draft, currentProfile.id)); refresh(); }} onExportProfile={async () => downloadText(await vault.exportProfile(currentProfile.id), `${safeFilename(currentProfile.name)}.rlprofile`)} onImportProfile={async (text) => { const id = await vault.importProfile(text); refresh(); await selectProfile(id); }}/>}
           </WorkspaceErrorBoundary>
         </main>
       </div>
@@ -695,7 +815,7 @@ function Unlock({ language, setLanguage, error, unlock }: { language: Language; 
   return <div className="unlock-page"><main className="unlock-box"><div className="language-switch"><button className={language === 'ru' ? 'active' : ''} onClick={() => setLanguage('ru')}>RU</button><button className={language === 'en' ? 'active' : ''} onClick={() => setLanguage('en')}>EN</button></div><div className="unlock-avatar"><LockIcon/></div><h1>{isRu ? 'Введите пароль' : 'Enter password'}</h1><p>{isRu ? 'Чтобы открыть ваши чаты' : 'To open your chats'}</p><form onSubmit={(event) => { event.preventDefault(); void unlock(password, rememberDevice); }}><input autoFocus type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="••••••••••••"/><label className="device-unlock-check"><input type="checkbox" checked={rememberDevice} onChange={(event) => setRememberDevice(event.target.checked)}/><span><strong>{isRu ? 'Запомнить на этом устройстве' : 'Remember on this device'}</strong><small>{isRu ? 'Не спрашивать пароль после обновления страницы' : 'Do not ask after refreshing the page'}</small></span></label><button className="primary" type="submit">{isRu ? 'Открыть' : 'Open'}</button></form>{error && <div className="inline-error">{error}</div>}</main></div>;
 }
 
-function Messenger({ data, scope, selected, onBack, selectConversation, setScreen, sendMessage, setSource, saveDraft, t }: { data: VaultData; scope: ProfileScope; selected?: string; onBack: () => void; selectConversation: (profileId: string, conversationId: string) => Promise<void>; setScreen: (screen: Screen) => void; sendMessage: (profileId: string, conversation: Conversation, body: string, sourceAccountId: string) => Promise<void>; setSource: (profileId: string, conversationId: string, accountId: string) => Promise<void>; saveDraft: (profileId: string, conversationId: string, body: string) => Promise<void>; t: typeof copy[Language] }) {
+function Messenger({ data, scope, selected, onBack, selectConversation, setScreen, sendMessage, setSource, saveDraft, setDeviceTrust, t }: { data: VaultData; scope: ProfileScope; selected?: string; onBack: () => void; selectConversation: (profileId: string, conversationId: string) => Promise<void>; setScreen: (screen: Screen) => void; sendMessage: (profileId: string, conversation: Conversation, body: string, sourceAccountId: string) => Promise<void>; setSource: (profileId: string, conversationId: string, accountId: string) => Promise<void>; saveDraft: (profileId: string, conversationId: string, body: string) => Promise<void>; setDeviceTrust: (profileId: string, conversationId: string, deviceId: string, trusted: boolean) => Promise<void>; t: typeof copy[Language] }) {
   const [query, setQuery] = useState('');
   const profile = activeProfile(data);
   const rows = useMemo(() => {
@@ -710,14 +830,15 @@ function Messenger({ data, scope, selected, onBack, selectConversation, setScree
   return <div className="messenger-grid"><section className="conversation-panel"><div className="section-head"><h2>{t.chats}</h2><button className="round-action" onClick={() => setScreen(newChatScreen)} title={newChatLabel} aria-label={newChatLabel}><PlusIcon/></button></div><label className="search"><SearchIcon/><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={languageHint(t, 'Поиск по чатам и сообщениям', 'Search chats and messages')}/></label><div className="conversation-list">{rows.map(({ profile: owner, conversation }) => {
     const contact = owner.contacts.find((item) => item.id === conversation.contactId);
     return <button key={`${owner.id}:${conversation.id}`} className={owner.id === profile.id && conversation.id === selected ? 'selected' : ''} onClick={() => void selectConversation(owner.id, conversation.id)}><span className="chat-avatar conversation-avatar">{conversation.title.slice(0, 2).toUpperCase()}<span className={`protocol-mini ${contact?.presence ?? 'offline'}`}>{conversation.protocol === 'tox' ? <ToxIcon/> : <XmppIcon/>}</span></span><span className="conversation-copy"><strong>{conversation.title}</strong><small>{scope === 'all' ? `${owner.name}: ` : ''}{lastMessage(owner.messages, conversation.id)?.body ?? languageHint(t, 'Новый диалог', 'New conversation')}</small></span><span className="conversation-meta"><time>{formatTime(conversation.updatedAt)}</time>{conversation.unread > 0 && <b>{conversation.unread}</b>}</span></button>;
-  })}{rows.length === 0 && <EmptyState title={query ? languageHint(t, 'Ничего не найдено', 'Nothing found') : t.noConversations} text={query ? languageHint(t, 'Попробуйте другой запрос.', 'Try another search.') : hasContacts ? languageHint(t, 'Выберите контакт и начните диалог.', 'Choose a contact and start a conversation.') : languageHint(t, 'Подключите аккаунт, чтобы начать общение.', 'Connect an account to start chatting.')} >{!query && <button className="primary compact-action" onClick={() => setScreen(newChatScreen)}>{newChatLabel}</button>}</EmptyState>}</div></section><section className="chat-panel">{current ? <ActiveChat profile={profile} conversation={current} messages={messages} onBack={onBack} send={sendMessage} setSource={setSource} saveDraft={saveDraft} t={t}/> : <div className="chat-idle"><div className="idle-bubble"><ChatIcon/></div><strong>{languageHint(t, 'Выберите чат', 'Choose a chat')}</strong><p>{languageHint(t, 'Здесь появятся сообщения.', 'Messages will appear here.')}</p></div>}</section></div>;
+  })}{rows.length === 0 && <EmptyState title={query ? languageHint(t, 'Ничего не найдено', 'Nothing found') : t.noConversations} text={query ? languageHint(t, 'Попробуйте другой запрос.', 'Try another search.') : hasContacts ? languageHint(t, 'Выберите контакт и начните диалог.', 'Choose a contact and start a conversation.') : languageHint(t, 'Подключите аккаунт, чтобы начать общение.', 'Connect an account to start chatting.')} >{!query && <button className="primary compact-action" onClick={() => setScreen(newChatScreen)}>{newChatLabel}</button>}</EmptyState>}</div></section><section className="chat-panel">{current ? <ActiveChat profile={profile} conversation={current} messages={messages} onBack={onBack} send={sendMessage} setSource={setSource} saveDraft={saveDraft} setDeviceTrust={setDeviceTrust} t={t}/> : <div className="chat-idle"><div className="idle-bubble"><ChatIcon/></div><strong>{languageHint(t, 'Выберите чат', 'Choose a chat')}</strong><p>{languageHint(t, 'Здесь появятся сообщения.', 'Messages will appear here.')}</p></div>}</section></div>;
 }
 
-function ActiveChat({ profile, conversation, messages, onBack, send, setSource, saveDraft, t }: { profile: LocalProfile; conversation: Conversation; messages: Message[]; onBack: () => void; send: (profileId: string, conversation: Conversation, body: string, sourceAccountId: string) => Promise<void>; setSource: (profileId: string, conversationId: string, accountId: string) => Promise<void>; saveDraft: (profileId: string, conversationId: string, body: string) => Promise<void>; t: typeof copy[Language] }) {
+function ActiveChat({ profile, conversation, messages, onBack, send, setSource, saveDraft, setDeviceTrust, t }: { profile: LocalProfile; conversation: Conversation; messages: Message[]; onBack: () => void; send: (profileId: string, conversation: Conversation, body: string, sourceAccountId: string) => Promise<void>; setSource: (profileId: string, conversationId: string, accountId: string) => Promise<void>; saveDraft: (profileId: string, conversationId: string, body: string) => Promise<void>; setDeviceTrust: (profileId: string, conversationId: string, deviceId: string, trusted: boolean) => Promise<void>; t: typeof copy[Language] }) {
   const [body, setBody] = useState(profile.drafts[conversation.id] ?? '');
+  const [securityOpen, setSecurityOpen] = useState(false);
   const [visibleCount, setVisibleCount] = useState(MESSAGE_RENDER_BATCH);
   const messagesEnd = useRef<HTMLDivElement>(null);
-  useEffect(() => { setBody(profile.drafts[conversation.id] ?? ''); setVisibleCount(MESSAGE_RENDER_BATCH); }, [conversation.id, profile.drafts]);
+  useEffect(() => { setBody(profile.drafts[conversation.id] ?? ''); setVisibleCount(MESSAGE_RENDER_BATCH); setSecurityOpen(false); }, [conversation.id, profile.drafts]);
   useEffect(() => { messagesEnd.current?.scrollIntoView?.({ block: 'end' }); }, [conversation.id, messages.length]);
   const hiddenMessageCount = Math.max(0, messages.length - visibleCount);
   const visibleMessages = hiddenMessageCount > 0 ? messages.slice(-visibleCount) : messages;
@@ -725,7 +846,8 @@ function ActiveChat({ profile, conversation, messages, onBack, send, setSource, 
   const sourceId = conversation.sourceAccountId ?? profile.ui.lastChannelByConversation[conversation.id] ?? (identities.length === 1 ? identities[0]?.id : undefined) ?? '';
   const contact = profile.contacts.find((item) => item.id === conversation.contactId);
   const security = encryptionLabel(conversation, t);
-  return <><div className="chat-head"><button className="back-button" onClick={onBack} aria-label={languageHint(t, 'Назад', 'Back')}><ArrowIcon/></button><span className="chat-avatar">{conversation.title.slice(0, 2).toUpperCase()}</span><div className="chat-head-copy"><h2>{conversation.title}</h2><small>{presenceLabel(contact?.presence ?? 'offline', t)}</small></div><span className={`security-state ${security.tone}`}>{conversation.protocol === 'tox' ? <ToxIcon/> : <XmppIcon/>}{security.label}</span></div><div className="messages">{messages.length === 0 && <div className="conversation-start"><strong>{conversation.title}</strong><span>{security.label}</span><p>{languageHint(t, 'Напишите первое сообщение.', 'Write the first message.')}</p></div>}{hiddenMessageCount > 0 && <button className="load-older" onClick={() => setVisibleCount((count) => count + MESSAGE_RENDER_BATCH)}>{languageHint(t, `Показать ещё ${Math.min(hiddenMessageCount, MESSAGE_RENDER_BATCH)}`, `Show ${Math.min(hiddenMessageCount, MESSAGE_RENDER_BATCH)} more`)}</button>}{visibleMessages.map((message) => <article key={message.id} className={`${message.direction} ${message.delivery === 'failed' ? 'failed' : ''}`}><p>{message.body}<span className="message-meta"><time>{formatTime(message.timestamp)}</time>{message.direction === 'outgoing' && <MessageDelivery state={message.delivery} t={t}/>}</span></p></article>)}<div className="message-anchor" ref={messagesEnd}/></div><form className="composer" onSubmit={(event) => { event.preventDefault(); const value = body.trim(); if (!value || !sourceId) return; setBody(''); void send(profile.id, conversation, value, sourceId).catch(() => setBody(value)); }}>{identities.length > 1 && <select className="identity-selector" aria-label={languageHint(t, 'Отправить от имени', 'Send as')} value={sourceId} onChange={(event) => void setSource(profile.id, conversation.id, event.target.value)} required><option value="" disabled>{languageHint(t, 'Выберите аккаунт', 'Choose account')}</option>{identities.map((identity) => <option key={identity.id} value={identity.id}>{identity.alias}</option>)}</select>}<textarea rows={1} value={body} onChange={(event) => setBody(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} onBlur={() => void saveDraft(profile.id, conversation.id, body)} placeholder={sourceId ? languageHint(t, 'Сообщение', 'Message') : languageHint(t, 'Сначала выберите аккаунт', 'Choose an account first')} maxLength={conversation.protocol === 'tox' ? TOX_MESSAGE_MAX_BYTES : XMPP_MESSAGE_MAX_BYTES}/><button type="submit" title={t.send} aria-label={t.send} disabled={!sourceId || !body.trim()}><SendIcon/></button></form></>;
+  const securityBadge = <>{conversation.protocol === 'tox' ? <ToxIcon/> : <XmppIcon/>}{security.label}</>;
+  return <><div className="chat-head"><button className="back-button" onClick={onBack} aria-label={languageHint(t, 'Назад', 'Back')}><ArrowIcon/></button><span className="chat-avatar">{conversation.title.slice(0, 2).toUpperCase()}</span><div className="chat-head-copy"><h2>{conversation.title}</h2><small>{presenceLabel(contact?.presence ?? 'offline', t)}</small></div>{conversation.encryption?.provider === 'omemo' ? <button className={`security-state ${security.tone}`} onClick={() => setSecurityOpen((open) => !open)} aria-expanded={securityOpen}>{securityBadge}</button> : <span className={`security-state ${security.tone}`}>{securityBadge}</span>}</div>{securityOpen && conversation.encryption?.provider === 'omemo' && <section className="security-sheet" role="dialog" aria-label={languageHint(t, 'Проверка шифрования', 'Encryption verification')}><div className="security-sheet-head"><div><strong>{languageHint(t, 'Проверка устройств', 'Verify devices')}</strong><small>{languageHint(t, 'Сверьте отпечаток другим надёжным способом.', 'Compare each fingerprint over another trusted channel.')}</small></div><button onClick={() => setSecurityOpen(false)} aria-label={languageHint(t, 'Закрыть', 'Close')}>×</button></div>{conversation.encryption.devices.length === 0 ? <p>{languageHint(t, 'Устройства контакта ещё не получены.', 'No contact devices have been received yet.')}</p> : conversation.encryption.devices.map((device) => <article className={device.changedAt ? 'changed' : ''} key={device.id}><div><strong>{device.label}</strong>{device.changedAt && <em>{languageHint(t, 'Ключ изменился', 'Key changed')}</em>}<code>{device.fingerprint || languageHint(t, 'Отпечаток недоступен', 'Fingerprint unavailable')}</code></div><button className={device.trust === 'trusted' ? 'trusted' : ''} disabled={!device.fingerprint} onClick={() => void setDeviceTrust(profile.id, conversation.id, device.id, device.trust !== 'trusted')}>{device.trust === 'trusted' ? languageHint(t, 'Проверено', 'Verified') : languageHint(t, 'Доверять', 'Trust')}</button></article>)}</section>}<div className="messages">{messages.length === 0 && <div className="conversation-start"><strong>{conversation.title}</strong><span>{security.label}</span><p>{languageHint(t, 'Напишите первое сообщение.', 'Write the first message.')}</p></div>}{hiddenMessageCount > 0 && <button className="load-older" onClick={() => setVisibleCount((count) => count + MESSAGE_RENDER_BATCH)}>{languageHint(t, `Показать ещё ${Math.min(hiddenMessageCount, MESSAGE_RENDER_BATCH)}`, `Show ${Math.min(hiddenMessageCount, MESSAGE_RENDER_BATCH)} more`)}</button>}{visibleMessages.map((message) => <article key={message.id} className={`${message.direction} ${message.delivery === 'failed' ? 'failed' : ''}`}><p>{message.body}<span className="message-meta"><time>{formatTime(message.timestamp)}</time>{message.direction === 'outgoing' && <MessageDelivery state={message.delivery} t={t}/>}</span></p></article>)}<div className="message-anchor" ref={messagesEnd}/></div><form className="composer" onSubmit={(event) => { event.preventDefault(); const value = body.trim(); if (!value || !sourceId) return; setBody(''); void send(profile.id, conversation, value, sourceId).catch(() => setBody(value)); }}>{identities.length > 1 && <select className="identity-selector" aria-label={languageHint(t, 'Отправить от имени', 'Send as')} value={sourceId} onChange={(event) => void setSource(profile.id, conversation.id, event.target.value)} required><option value="" disabled>{languageHint(t, 'Выберите аккаунт', 'Choose account')}</option>{identities.map((identity) => <option key={identity.id} value={identity.id}>{identity.alias}</option>)}</select>}<textarea rows={1} value={body} onChange={(event) => setBody(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} onBlur={() => void saveDraft(profile.id, conversation.id, body)} placeholder={sourceId ? languageHint(t, 'Сообщение', 'Message') : languageHint(t, 'Сначала выберите аккаунт', 'Choose an account first')} maxLength={conversation.protocol === 'tox' ? TOX_MESSAGE_MAX_BYTES : XMPP_MESSAGE_MAX_BYTES}/><button type="submit" title={t.send} aria-label={t.send} disabled={!sourceId || !body.trim()}><SendIcon/></button></form></>;
 }
 
 function Accounts({ profile, addXmpp, connectXmpp, addTox, connectTox, disconnectAccount, removeAccount, exportAccount, t }: { profile: LocalProfile; addXmpp: (account: Account) => Promise<void>; connectXmpp: (account: Account) => void; addTox: (alias: string, savedata?: string) => Promise<void>; connectTox: (account: Account) => Promise<ToxClient>; disconnectAccount: (account: Account) => Promise<void>; removeAccount: (account: Account) => Promise<void>; exportAccount: (account: Account) => Promise<void>; t: typeof copy[Language] }) {
@@ -751,7 +873,7 @@ function Accounts({ profile, addXmpp, connectXmpp, addTox, connectTox, disconnec
               </div>
             </div>
           ))}
-          {profile.accounts.length === 0 && <EmptyState title={languageHint(t, 'Аккаунтов пока нет', 'No accounts yet')} text={languageHint(t, 'Выберите XMPP или Tox, чтобы начать.', 'Choose XMPP or Tox to get started.')}/>} 
+          {profile.accounts.length === 0 && <EmptyState title={languageHint(t, 'Аккаунтов пока нет', 'No accounts yet')} text={languageHint(t, 'Выберите XMPP или Tox, чтобы начать.', 'Choose XMPP or Tox to get started.')}/>}
         </div>
       </section>
       <section className="form-panel">
@@ -816,7 +938,7 @@ function ContactRow({ contact, open, rename, t }: { contact: Contact; open: () =
 
 function Privacy({ data, profile, network, t, onLock, onWipe, onExport }: { data: VaultData; profile: LocalProfile; network: NetworkActivity[]; t: typeof copy[Language]; onLock: () => void; onWipe: () => Promise<void>; onExport: () => Promise<void> }) {
   const messageCount = data.profiles.reduce((count, item) => count + item.messages.length, 0);
-  return <div className="single-page privacy-page"><PageTitle index="04" title={t.privacy} subtitle={profile.name}/><section className="summary-list"><div><span>{languageHint(t, 'Сообщения на устройстве', 'Messages on device')}</span><strong>{messageCount}</strong></div><div><span>{t.currentConnections}</span><strong>{network.filter((item) => item.state === 'open').length}</strong></div></section><p className="simple-notice">{languageHint(t, 'Хранилище, пароли, ключи и история остаются на устройстве и не отправляются в Relayless. Для связи XMPP передаёт данные входа только выбранному серверу по WSS, а Tox-шлюз пересылает зашифрованные пакеты. Аналитики и трекеров нет.', 'The vault, passwords, keys, and history stay on this device and are never sent to Relayless. To communicate, XMPP sends credentials only to the selected server over WSS, while the Tox gateway forwards encrypted packets. There are no analytics or trackers.')}</p><section className="vault-actions"><button onClick={() => void onExport()}><DownloadIcon/><span><strong>{languageHint(t, 'Скачать резервную копию', 'Download backup')}</strong><small>{languageHint(t, 'Копия защищена вашим паролем', 'Protected with your password')}</small></span><ArrowIcon/></button><button onClick={onLock}><LockIcon/><span><strong>{t.lock}</strong><small>{languageHint(t, 'Потребуется снова ввести пароль', 'You will need to enter your password again')}</small></span><ArrowIcon/></button><button className="danger" onClick={() => { if (window.confirm(t.dangerWipe)) void onWipe(); }}><span className="delete-x">×</span><span><strong>{t.wipe}</strong><small>{t.dangerWipe}</small></span><ArrowIcon/></button></section></div>;
+  return <div className="single-page privacy-page"><PageTitle index="04" title={t.privacy} subtitle={profile.name}/><section className="summary-list"><div><span>{languageHint(t, 'Сообщения на устройстве', 'Messages on device')}</span><strong>{messageCount}</strong></div><div><span>{t.currentConnections}</span><strong>{network.filter((item) => item.state === 'open').length}</strong></div></section><p className="simple-notice">{languageHint(t, 'Хранилище, пароли, OMEMO-ключи и история остаются в зашифрованном виде на этом устройстве. Аналитики и трекеров нет. GitHub видит обычные данные веб-запроса (например IP и время), выбранный XMPP-сервер — JID и метаданные доставки, а Cloudflare Tox-шлюз — IP, время и объём зашифрованного трафика. Содержимое Tox и OMEMO-сообщений этим посредникам недоступно.', 'The vault, passwords, OMEMO keys, and history stay encrypted on this device. There are no analytics or trackers. GitHub sees ordinary web-request metadata such as IP and time, the selected XMPP server sees JIDs and delivery metadata, and the Cloudflare Tox gateway sees IP, timing, and encrypted traffic volume. These intermediaries cannot read Tox or OMEMO message content.')}</p><section className="vault-actions"><button onClick={() => void onExport()}><DownloadIcon/><span><strong>{languageHint(t, 'Скачать резервную копию', 'Download backup')}</strong><small>{languageHint(t, 'Копия защищена вашим паролем', 'Protected with your password')}</small></span><ArrowIcon/></button><button onClick={onLock}><LockIcon/><span><strong>{t.lock}</strong><small>{languageHint(t, 'Потребуется снова ввести пароль', 'You will need to enter your password again')}</small></span><ArrowIcon/></button><button className="danger" onClick={() => { if (window.confirm(t.dangerWipe)) void onWipe(); }}><span className="delete-x">×</span><span><strong>{t.wipe}</strong><small>{t.dangerWipe}</small></span><ArrowIcon/></button></section></div>;
 }
 
 function Plugins({ data, t, onInstall, onToggle, onRemove }: { data: VaultData; t: typeof copy[Language]; onInstall: (source: string, granted: PluginPermission[]) => Promise<void>; onToggle: (id: string) => Promise<void>; onRemove: (id: string) => Promise<void> }) {

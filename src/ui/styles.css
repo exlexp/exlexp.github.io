@@ -120,9 +120,23 @@ input:focus, textarea:focus, select:focus { border-color: var(--chat-blue); box-
 .chat-head-copy { min-width: 0; }
 .chat-head-copy h2, .chat-head-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .security-state { margin-left: auto; min-height: 30px; padding: 0 10px; display: inline-flex; align-items: center; gap: 6px; border-radius: 9px; background: #f2f5f7; color: #6c7883; font-size: 11px; font-weight: 650; white-space: nowrap; }
+button.security-state { border: 0; font: inherit; cursor: pointer; }
 .security-state.secure { background: #ebf7ef; color: #2f8555; }
 .security-state.warning { background: #fff6e7; color: #87601c; }
 .security-state svg, .security-state img { width: 14px; height: 14px; object-fit: contain; }
+.security-sheet { flex: 0 0 auto; padding: 14px 18px; border-bottom: 1px solid var(--chat-line); background: #fff; box-shadow: 0 6px 20px rgba(32, 56, 76, .08); }
+.security-sheet-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
+.security-sheet-head strong, .security-sheet-head small { display: block; }
+.security-sheet-head small { margin-top: 3px; color: var(--chat-muted); font-size: 11px; }
+.security-sheet-head > button { border: 0; background: transparent; color: var(--chat-muted); font-size: 21px; line-height: 1; cursor: pointer; }
+.security-sheet article { display: flex; align-items: center; gap: 14px; padding: 10px 0; border-top: 1px solid #edf0f2; }
+.security-sheet article > div { min-width: 0; flex: 1; }
+.security-sheet article strong { font-size: 12px; }
+.security-sheet article em { margin-left: 8px; color: #c43d3d; font-size: 11px; font-style: normal; }
+.security-sheet code { display: block; margin-top: 5px; color: #5f6d79; font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+.security-sheet article > button { min-width: 82px; padding: 7px 10px; border: 1px solid #d7dfe5; border-radius: 9px; background: #fff; color: #4b5b68; font-size: 11px; font-weight: 650; cursor: pointer; }
+.security-sheet article > button.trusted { border-color: #b9dfc6; background: #ebf7ef; color: #2f8555; }
+.security-sheet article > button:disabled { opacity: .5; cursor: default; }
 .back-button { display: none; width: 34px; height: 34px; place-content: center; border: 0; border-radius: 50%; background: transparent; color: var(--chat-muted); cursor: pointer; }
 .back-button svg { transform: rotate(180deg); width: 18px; }
 .messages { flex: 1; min-height: 0; overflow: auto; padding: 24px clamp(18px, 7vw, 90px); display: flex; flex-direction: column; gap: 7px; }

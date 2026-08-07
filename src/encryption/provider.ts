@@ -88,6 +88,5 @@ export function resolveEncryptionProvider(
   }
   if (availability.omemo) return 'omemo';
   if (availability.otr) return 'otr';
-  if (!plaintextConfirmed) throw new PlaintextConfirmationRequired();
-  return 'plaintext';
+  throw new Error('End-to-end encryption is unavailable; message was not sent');
 }

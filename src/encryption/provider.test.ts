@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { PlaintextConfirmationRequired, resolveEncryptionProvider } from './provider';
+import { resolveEncryptionProvider } from './provider';
 
 describe('encryption policy', () => {
   it('prefers OMEMO and then OTR in secure-auto mode', () => {
@@ -7,9 +7,9 @@ describe('encryption policy', () => {
     expect(resolveEncryptionProvider('secure-auto', { omemo: false, otr: true })).toBe('otr');
   });
 
-  it('refuses silent downgrade to plaintext', () => {
-    expect(() => resolveEncryptionProvider('secure-auto', { omemo: false, otr: false })).toThrow(PlaintextConfirmationRequired);
-    expect(resolveEncryptionProvider('secure-auto', { omemo: false, otr: false }, true)).toBe('plaintext');
+  it('refuses every downgrade from secure-auto to plaintext', () => {
+    expect(() => resolveEncryptionProvider('secure-auto', { omemo: false, otr: false })).toThrow(/not sent/i);
+    expect(() => resolveEncryptionProvider('secure-auto', { omemo: false, otr: false }, true)).toThrow(/not sent/i);
   });
 
   it('refuses unavailable forced providers', () => {

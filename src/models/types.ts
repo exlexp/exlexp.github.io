@@ -119,6 +119,20 @@ export interface ProfileUiState {
   lastActiveAt: number;
 }
 
+export type OmemoStoredValue =
+  | { kind: 'number'; value: number }
+  | { kind: 'text'; value: string }
+  | { kind: 'bytes'; value: string }
+  | { kind: 'keypair'; publicKey: string; privateKey: string };
+
+export interface OmemoAccountState {
+  version: 1;
+  deviceId: number;
+  signedPreKeyId: number;
+  signedPreKeySignature: string;
+  store: Record<string, OmemoStoredValue>;
+}
+
 export interface LocalProfile {
   id: string;
   name: string;
@@ -139,6 +153,7 @@ export interface LocalProfile {
   linkedIdentities: Array<{ id: string; contactIds: string[] }>;
   settings: ProfileSettings;
   ui: ProfileUiState;
+  omemoAccounts: Record<string, OmemoAccountState>;
 }
 
 export interface VaultSettings {
@@ -189,6 +204,7 @@ export function createLocalProfile(name: string, order: number, ephemeral = fals
       defaultEncryptionPolicy: 'secure-auto',
     },
     ui: { lastChannelByConversation: {}, lastActiveAt: Date.now() },
+    omemoAccounts: {},
   };
 }
 

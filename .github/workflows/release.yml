@@ -9,8 +9,8 @@ jobs:
   unsigned-bundle:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
           cache: npm
@@ -18,7 +18,7 @@ jobs:
       - run: npm run verify
       - run: npm run bundle:iwa
       - run: npm run checksums
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: relayless-unsigned-${{ github.ref_name }}
           path: |
@@ -26,5 +26,4 @@ jobs:
             dist/SHA256SUMS
           if-no-files-found: error
 
-# Signing is intentionally absent. Download the unsigned artifact, rebuild if
-# desired, and sign locally with the offline key described in BUILDING.md.
+# Signing is intentionally absent: the private signing key must never enter CI.

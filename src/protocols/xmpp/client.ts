@@ -18,12 +18,27 @@ export type XmppState = 'offline' | 'connecting' | 'authenticating' | 'online' |
 export type XmppEvent =
   | { type: 'state'; state: XmppState; detail?: string }
   | { type: 'message'; id: string; from: string; body: string; timestamp: number; archived?: boolean }
+  | { type: 'encrypted-message'; id: string; from: string; timestamp: number; archived?: boolean; payload: XmppOmemoPayload }
   | { type: 'receipt'; id: string; from: string }
   | { type: 'presence'; from: string; show: string }
   | { type: 'chat-state'; from: string; state: 'active' | 'composing' | 'paused' | 'inactive' | 'gone' }
   | { type: 'roster'; contacts: Array<{ jid: string; name: string }> };
 
 type Listener = (event: XmppEvent) => void;
+
+export interface XmppOmemoPayload {
+  namespace: 'urn:xmpp:omemo:2';
+  senderDeviceId: number;
+  encryptedKey: string;
+  keyExchange: boolean;
+  ciphertext: string;
+}
+
+interface PendingIq {
+  resolve: (element: Element) => void;
+  reject: (error: Error) => void;
+  timer: number;
+}
 
 export class XmppClient {
   private socket: WebSocket | undefined;
@@ -39,6 +54,8 @@ export class XmppClient {
   private expectedServerSignature: string | undefined;
   private readonly stream = new XmppStreamManager();
   private serverSupportsStreamManagement = false;
+  private readonly pendingIq = new Map<string, PendingIq>();
+  private omemoDeviceId: number | undefined;
 
   subscribe(listener: Listener): () => void {
     this.listeners.add(listener);
@@ -65,7 +82,41 @@ export class XmppClient {
     if (this.activityId) networkPolicy.setState(this.activityId, 'closed');
     this.resetSession();
     this.stream.reset();
+    this.rejectPendingIq(new Error('XMPP account disconnected'));
     this.emit({ type: 'state', state: 'offline' });
+  }
+
+  requestIq(innerXml: string, options: { type?: 'get' | 'set'; to?: string; timeoutMs?: number } = {}): Promise<Element> {
+    if (!this.bound || this.socket?.readyState !== WebSocket.OPEN) return Promise.reject(new Error('XMPP account is offline'));
+    const id = `relayless-${crypto.randomUUID()}`;
+    const to = options.to ? ` to="${escapeXml(options.to)}"` : '';
+    const type = options.type ?? 'get';
+    return new Promise<Element>((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        this.pendingIq.delete(id);
+        reject(new Error('XMPP server did not answer the request'));
+      }, options.timeoutMs ?? 12_000);
+      this.pendingIq.set(id, { resolve, reject, timer });
+      try { this.send(`<iq type="${type}" id="${id}"${to}>${innerXml}</iq>`); }
+      catch (error) {
+        window.clearTimeout(timer);
+        this.pendingIq.delete(id);
+        reject(error instanceof Error ? error : new Error('XMPP request failed'));
+      }
+    });
+  }
+
+  sendEncryptedMessage(to: string, encryptedXml: string): string {
+    if (!this.bound || this.socket?.readyState !== WebSocket.OPEN) throw new Error('XMPP account is offline');
+    const id = crypto.randomUUID();
+    this.send(
+      `<message to="${escapeXml(to)}" type="chat" id="${id}">` +
+        encryptedXml +
+        `<store xmlns="urn:xmpp:hints"/>` +
+        `<request xmlns="urn:xmpp:receipts"/>` +
+      `</message>`,
+    );
+    return id;
   }
 
   sendMessage(to: string, body: string): string {
@@ -239,6 +290,14 @@ export class XmppClient {
 
   private handleIq(iq: Element): void {
     const id = iq.getAttribute('id') ?? '';
+    const pending = this.pendingIq.get(id);
+    if (pending) {
+      window.clearTimeout(pending.timer);
+      this.pendingIq.delete(id);
+      if (iq.getAttribute('type') === 'error') pending.reject(new Error(xmppIqError(iq)));
+      else pending.resolve(iq);
+      return;
+    }
     if (id === 'bind-1' && iq.getAttribute('type') === 'result') {
       this.bound = true;
       this.reconnectAttempt = 0;
@@ -281,6 +340,31 @@ export class XmppClient {
   }
 
   private emitMessage(message: Element, timestamp: number, archived: boolean): string | undefined {
+    const encrypted = descendants(message, 'encrypted').find((item) => item.namespaceURI === 'urn:xmpp:omemo:2');
+    if (encrypted) {
+      const header = firstDescendant(encrypted, 'header');
+      const payload = firstDescendant(encrypted, 'payload');
+      const ownJid = bareJid(this.credentials?.jid ?? '');
+      const keyGroup = descendants(header ?? encrypted, 'keys').find((item) => bareJid(item.getAttribute('jid') ?? '') === ownJid);
+      const ownDeviceId = Number(this.omemoDeviceId);
+      const key = descendants(keyGroup ?? encrypted, 'key').find((item) => Number(item.getAttribute('rid')) === ownDeviceId);
+      const senderDeviceId = Number(header?.getAttribute('sid'));
+      if (payload && key && Number.isInteger(senderDeviceId) && senderDeviceId > 0) {
+        const id = message.getAttribute('id') || crypto.randomUUID();
+        this.emit({
+          type: 'encrypted-message', id, from: bareJid(message.getAttribute('from') ?? ''),
+          timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(), archived,
+          payload: {
+            namespace: 'urn:xmpp:omemo:2', senderDeviceId,
+            encryptedKey: key.textContent?.trim() ?? '',
+            keyExchange: key.getAttribute('kex') === 'true' || key.getAttribute('kex') === '1',
+            ciphertext: payload.textContent?.trim() ?? '',
+          },
+        });
+        return id;
+      }
+      return undefined;
+    }
     const body = textOf(message, 'body');
     if (body === undefined) return undefined;
     const id = message.getAttribute('id') || crypto.randomUUID();
@@ -316,6 +400,7 @@ export class XmppClient {
   private fail(detail: string): void {
     if (this.activityId) networkPolicy.setState(this.activityId, 'failed');
     this.emit({ type: 'state', state: 'error', detail });
+    this.rejectPendingIq(new Error(detail));
     this.socket?.close();
   }
 
@@ -338,6 +423,18 @@ export class XmppClient {
   private emit(event: XmppEvent): void {
     for (const listener of this.listeners) listener(event);
   }
+
+  setOmemoDeviceId(deviceId: number | undefined): void {
+    this.omemoDeviceId = deviceId;
+  }
+
+  private rejectPendingIq(error: Error): void {
+    for (const pending of this.pendingIq.values()) {
+      window.clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pendingIq.clear();
+  }
 }
 
 function parseJid(jid: string): { local: string; domain: string } {
@@ -349,4 +446,10 @@ function parseJid(jid: string): { local: string; domain: string } {
 
 function bareJid(jid: string): string {
   return jid.split('/')[0] ?? jid;
+}
+
+function xmppIqError(iq: Element): string {
+  const error = firstDescendant(iq, 'error');
+  const condition = error ? Array.from(error.children).find((child) => child.namespaceURI === 'urn:ietf:params:xml:ns:xmpp-stanzas') : undefined;
+  return `XMPP request rejected${condition ? `: ${condition.localName}` : ''}`;
 }

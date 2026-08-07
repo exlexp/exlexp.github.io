@@ -28,6 +28,7 @@ const MAX_BUFFERED_BYTES = 1024 * 1024;
 const RELAY_OPEN_TIMEOUT_MS = 8_000;
 const OPEN_ATTEMPTS_PER_MINUTE = 30;
 const recentConnections = new Map<string, number[]>();
+const rateLimitSalt = crypto.getRandomValues(new Uint8Array(32));
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -44,7 +45,8 @@ export default {
     if (!relayAllowed(host, port)) return json({ error: 'Relay denied' }, 403);
 
     const clientAddress = request.headers.get('CF-Connecting-IP') ?? 'unknown';
-    if (!allowConnection(clientAddress)) return json({ error: 'Too many connections' }, 429);
+    const connectionKey = await pseudonymousConnectionKey(clientAddress);
+    if (!allowConnection(connectionKey)) return json({ error: 'Too many connections' }, 429);
 
     let tcp: Socket | undefined;
     try {
@@ -146,6 +148,15 @@ function allowConnection(address: string): boolean {
     }
   }
   return true;
+}
+
+async function pseudonymousConnectionKey(address: string): Promise<string> {
+  const encoded = new TextEncoder().encode(address);
+  const input = new Uint8Array(rateLimitSalt.byteLength + encoded.byteLength);
+  input.set(rateLimitSalt);
+  input.set(encoded, rateLimitSalt.byteLength);
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', input));
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 function json(value: unknown, status = 200): Response {

@@ -30,15 +30,17 @@
   "dependencies": {
     "hash-wasm": "4.12.0",
     "idb": "8.0.3",
+    "libomemo.js": "3.0.0",
     "lucide-react": "1.30.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
-    "simple-icons": "^16.28.0"
+    "simple-icons": "16.28.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20260804.1",
     "@eslint/js": "10.0.1",
     "@testing-library/react": "16.3.2",
+    "@types/jsdom": "30.0.0",
     "@types/node": "26.2.0",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.4",
@@ -51,9 +53,9 @@
     "typescript-eslint": "8.66.0",
     "vite": "8.2.1",
     "vitest": "4.1.10",
-    "wrangler": "4.120.0",
-    "ws": "8.21.3",
     "wbn": "0.0.9",
-    "wbn-sign": "0.3.1"
+    "wbn-sign": "0.3.1",
+    "wrangler": "4.120.0",
+    "ws": "8.21.3"
   }
 }

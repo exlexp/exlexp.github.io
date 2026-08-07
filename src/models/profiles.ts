@@ -54,6 +54,7 @@ export function normalizeVault(data: VaultData): VaultData {
     profile.drafts ??= {};
     profile.friendRequests ??= [];
     profile.ui ??= { lastChannelByConversation: {}, lastActiveAt: Date.now() };
+    profile.omemoAccounts ??= {};
     profile.ui.lastChannelByConversation ??= {};
     profile.settings ??= {
       statusMessage: '',
