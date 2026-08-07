@@ -24,7 +24,7 @@ export class ToxClient {
   }
 
   async start(options: { savedata?: string; name: string; status?: string }): Promise<void> {
-    const response = await fetch('/tox-bootstrap-nodes.json', { cache: 'no-store', credentials: 'same-origin' });
+    const response = await fetch(`${import.meta.env.BASE_URL}tox-bootstrap-nodes.json`, { cache: 'no-store', credentials: 'same-origin' });
     if (!response.ok) throw new Error('Bundled Tox bootstrap list is unavailable');
     const document = await response.json() as BootstrapDocument;
     validateNodes(document.nodes);

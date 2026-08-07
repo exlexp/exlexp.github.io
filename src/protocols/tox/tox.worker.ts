@@ -166,13 +166,14 @@ function sendMessage(friendNumber: number, text: string): number {
 }
 
 async function loadCore(): Promise<ToxCoreModule> {
-  const response = await fetch('/tox/toxcore.mjs', { cache: 'no-store', credentials: 'same-origin' });
+  const publicBase = import.meta.env.BASE_URL;
+  const response = await fetch(`${publicBase}tox/toxcore.mjs`, { cache: 'no-store', credentials: 'same-origin' });
   if (!response.ok) throw new Error('c-toxcore JavaScript module is unavailable');
   const objectUrl = URL.createObjectURL(new Blob([await response.text()], { type: 'text/javascript' }));
   try {
     const imported = await import(/* @vite-ignore */ objectUrl) as { default: (options: ToxCoreFactoryOptions) => Promise<ToxCoreModule> };
     return await imported.default({
-    locateFile: (path) => `/tox/${path}`,
+    locateFile: (path) => `${publicBase}tox/${path}`,
     relayHasDirectSockets: () => typeof TCPSocket === 'function' && typeof UDPSocket === 'function',
     relayNetSocket: (domain, type, protocol) => bridge.socket(domain, type, protocol),
     relayNetBind: (handle, family, port) => bridge.bind(handle, family, port),

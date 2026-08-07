@@ -13,7 +13,7 @@ export function showLocalMessageNotification(
   if (!('Notification' in globalThis) || Notification.permission !== 'granted' || document.visibilityState === 'visible') return false;
   const notification = new Notification(`${conversationTitle} · ${profileName}`, {
     body: showPreview ? body : 'New message — preview hidden locally',
-    icon: '/icon.svg',
+    icon: `${import.meta.env.BASE_URL}icon.svg`,
     tag: `relayless:${profileName}:${conversationTitle}`,
     silent: false,
   });

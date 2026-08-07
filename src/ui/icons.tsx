@@ -49,5 +49,5 @@ export function XmppIcon(props: SVGProps<SVGSVGElement>) {
 }
 
 export function ToxIcon() {
-  return <img src="/icons/qtox.svg" alt="" aria-hidden="true"/>;
+  return <img src={`${import.meta.env.BASE_URL}icons/qtox.svg`} alt="" aria-hidden="true"/>;
 }
