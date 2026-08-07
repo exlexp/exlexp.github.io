@@ -1,5 +1,4 @@
 import { Component, useCallback, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from 'react';
-import { BRAND } from '../config/branding';
 import { activeProfile, createProfile, deleteProfile, duplicateProfileSettings, reorderProfiles } from '../models/profiles';
 import { conversationMatchesQuery, ensureConversation, recordIncomingActivity } from '../models/conversations';
 import { requireSourceIdentity, switchProfileState } from '../models/profileRuntime';
@@ -151,7 +150,7 @@ export function App() {
     vault.lock(); setData(undefined); setGate('unlock');
   }
 
-  if (gate === 'loading') return <div className="boot"><span className="pulse"/> {BRAND.productName} / LOCAL BOOT</div>;
+  if (gate === 'loading') return <div className="boot"/>;
   if (gate === 'launch') return <FirstLaunch language={language} setLanguage={setLanguage} error={error} createPersistent={createPersistent} createEphemeral={createEphemeral}/>;
   if (gate === 'unlock') return <Unlock language={language} setLanguage={setLanguage} error={error} unlock={unlock}/>;
   if (!data) return null;
@@ -310,7 +309,7 @@ export function App() {
         setError(event.detail);
       }
       if (event.type === 'omemo-devices') {
-        omemoEngines.current.get(key)?.updateDeviceList(event.from, event.deviceIds);
+        omemoEngines.current.get(key)?.updateDeviceList(event.from, event.deviceIds, event.namespace);
       }
     });
     xmppClients.current.set(key, client);
@@ -605,7 +604,7 @@ export function App() {
           const engine = omemoEngines.current.get(`${profileId}:${sourceAccountId}`);
           if (!engine) throw new Error('OMEMO is not ready; message was not sent');
           const encrypted = await engine.encrypt(contact.address, body);
-          sentId = client.sendEncryptedMessage(contact.address, encrypted.xml);
+          sentId = client.sendEncryptedMessage(contact.address, encrypted.xml, encrypted.namespace);
           await vault.update((draft) => {
             const current = draft.profiles.find((item) => item.id === profileId)?.conversations.find((item) => item.id === conversation.id);
             if (!current) return;
@@ -957,7 +956,134 @@ function Messenger({ data, scope, selected, onBack, selectConversation, setScree
   ]}/>; })()}</div>;
 }
 
-function ActiveChat({ profile, conversation, messages, onBack, send, retry, setSource, saveDraft, setDeviceTrust, setEncryptionPolicy, t }: { profile: LocalProfile; conversation: Conversation; messages: Message[]; onBack: () => void; send: (profileId: string, conversation: Conversation, body: string, sourceAccountId: string) => Promise<void>; retry: (profileId: string, conversation: Conversation, message: Message) => Promise<void>; setSource: (profileId: string, conversationId: string, accountId: string) => Promise<void>; saveDraft: (profileId: string, conversationId: string, body: string) => Promise<void>; setDeviceTrust: (profileId: string, conversationId: string, deviceId: string, trusted: boolean) => Promise<void>; setEncryptionPolicy: (profileId: string, conversationId: string, policy: 'secure-auto' | 'force-omemo' | 'plaintext') => Promise<void>; t: typeof copy[Language] }) {
+type ActiveChatProps = {
+  profile: LocalProfile;
+  conversation: Conversation;
+  messages: Message[];
+  onBack: () => void;
+  send: (profileId: string, conversation: Conversation, body: string, sourceAccountId: string) => Promise<void>;
+  retry: (profileId: string, conversation: Conversation, message: Message) => Promise<void>;
+  setSource: (profileId: string, conversationId: string, accountId: string) => Promise<void>;
+  saveDraft: (profileId: string, conversationId: string, body: string) => Promise<void>;
+  setDeviceTrust: (profileId: string, conversationId: string, deviceId: string, trusted: boolean) => Promise<void>;
+  setEncryptionPolicy: (profileId: string, conversationId: string, policy: 'secure-auto' | 'force-omemo' | 'plaintext') => Promise<void>;
+  t: typeof copy[Language];
+};
+
+function ActiveChat({ profile, conversation, messages, onBack, send, retry, setSource, saveDraft, setDeviceTrust, setEncryptionPolicy, t }: ActiveChatProps) {
+  const [body, setBody] = useState(profile.drafts[conversation.id] ?? '');
+  const [securityOpen, setSecurityOpen] = useState(false);
+  const [visibleCount, setVisibleCount] = useState(MESSAGE_RENDER_BATCH);
+  const messagesEnd = useRef<HTMLDivElement>(null);
+  const securityMenu = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setBody(profile.drafts[conversation.id] ?? '');
+    setVisibleCount(MESSAGE_RENDER_BATCH);
+    setSecurityOpen(false);
+  }, [conversation.id, profile.drafts]);
+  useEffect(() => { messagesEnd.current?.scrollIntoView?.({ block: 'end' }); }, [conversation.id, messages.length]);
+  useEffect(() => {
+    if (!securityOpen) return;
+    const close = (event: PointerEvent) => {
+      if (!securityMenu.current?.contains(event.target as Node)) setSecurityOpen(false);
+    };
+    document.addEventListener('pointerdown', close);
+    return () => document.removeEventListener('pointerdown', close);
+  }, [securityOpen]);
+
+  const hiddenMessageCount = Math.max(0, messages.length - visibleCount);
+  const visibleMessages = hiddenMessageCount > 0 ? messages.slice(-visibleCount) : messages;
+  const identities = profile.accounts.filter((account) => account.protocol === conversation.protocol);
+  const sourceId = conversation.sourceAccountId ?? profile.ui.lastChannelByConversation[conversation.id] ?? (identities.length === 1 ? identities[0]?.id : undefined) ?? '';
+  const contact = profile.contacts.find((item) => item.id === conversation.contactId);
+  const security = encryptionLabel(conversation, t);
+  const encryptionPolicy = conversation.encryption?.policy ?? 'secure-auto';
+  const compactSecurityLabel = conversation.protocol === 'tox'
+    ? 'Tox'
+    : encryptionPolicy === 'plaintext'
+      ? 'TLS'
+      : encryptionPolicy === 'force-omemo' || conversation.encryption?.provider === 'omemo'
+        ? 'OMEMO'
+        : languageHint(t, 'Авто', 'Auto');
+  const chooseEncryption = (policy: 'secure-auto' | 'force-omemo' | 'plaintext') => {
+    setSecurityOpen(false);
+    void setEncryptionPolicy(profile.id, conversation.id, policy);
+  };
+
+  return (
+    <>
+      <div className="chat-head">
+        <button className="back-button" onClick={onBack} aria-label={languageHint(t, 'Назад', 'Back')}><ArrowIcon/></button>
+        <span className="chat-avatar">{conversation.title.slice(0, 2).toUpperCase()}</span>
+        <div className="chat-head-copy"><h2>{conversation.title}</h2><small>{presenceLabel(contact?.presence ?? 'offline', t)}</small></div>
+      </div>
+      <div className="messages">
+        {messages.length === 0 && <div className="conversation-start"><strong>{conversation.title}</strong><span>{security.label}</span><p>{languageHint(t, 'Напишите первое сообщение.', 'Write the first message.')}</p></div>}
+        {hiddenMessageCount > 0 && <button className="load-older" onClick={() => setVisibleCount((count) => count + MESSAGE_RENDER_BATCH)}>{languageHint(t, `Показать ещё ${Math.min(hiddenMessageCount, MESSAGE_RENDER_BATCH)}`, `Show ${Math.min(hiddenMessageCount, MESSAGE_RENDER_BATCH)} more`)}</button>}
+        {visibleMessages.map((message) => (
+          <article key={message.id} className={`${message.direction} ${message.delivery === 'failed' ? 'failed' : ''}`}>
+            <p>{message.body}<span className="message-meta"><time>{formatTime(message.timestamp)}</time>{message.direction === 'outgoing' && <MessageDelivery state={message.delivery} t={t}/>}</span></p>
+            {message.direction === 'outgoing' && message.delivery === 'failed' && <button className="retry-message" onClick={() => void retry(profile.id, conversation, message)}>{languageHint(t, 'Повторить', 'Retry')}</button>}
+          </article>
+        ))}
+        <div className="message-anchor" ref={messagesEnd}/>
+      </div>
+      <form className="composer" onSubmit={(event) => {
+        event.preventDefault();
+        const value = body.trim();
+        if (!value || !sourceId) return;
+        setBody('');
+        void send(profile.id, conversation, value, sourceId).catch(() => setBody(value));
+      }}>
+        <div className="composer-security-wrap" ref={securityMenu}>
+          {conversation.protocol === 'xmpp' ? (
+            <button
+              type="button"
+              className={`composer-security ${security.tone}`}
+              onClick={() => setSecurityOpen((open) => !open)}
+              aria-expanded={securityOpen}
+              aria-haspopup="dialog"
+              title={languageHint(t, 'Выбрать шифрование', 'Choose encryption')}
+            ><ShieldIcon/><span>{compactSecurityLabel}</span></button>
+          ) : (
+            <span className="composer-security secure" title={security.label}><LockIcon/><span>Tox</span></span>
+          )}
+          {securityOpen && conversation.protocol === 'xmpp' && (
+            <section className="security-popover" role="dialog" aria-label={languageHint(t, 'Настройки шифрования', 'Encryption settings')}>
+              <div className="security-popover-title"><strong>{languageHint(t, 'Шифрование', 'Encryption')}</strong><small>{languageHint(t, 'Для этого чата', 'For this chat')}</small></div>
+              <div className="encryption-options">
+                <button type="button" className={encryptionPolicy === 'secure-auto' ? 'active' : ''} onClick={() => chooseEncryption('secure-auto')}><strong>{languageHint(t, 'Авто', 'Auto')}</strong><small>{languageHint(t, 'OMEMO, если доступно', 'OMEMO when available')}</small></button>
+                <button type="button" className={encryptionPolicy === 'force-omemo' ? 'active' : ''} onClick={() => chooseEncryption('force-omemo')}><strong>OMEMO</strong><small>{languageHint(t, 'Только сквозное', 'End-to-end only')}</small></button>
+                <button type="button" className={encryptionPolicy === 'plaintext' ? 'active warning' : ''} onClick={() => chooseEncryption('plaintext')}><strong>TLS</strong><small>{languageHint(t, 'Сервер видит текст', 'Server can read text')}</small></button>
+              </div>
+              {conversation.encryption?.warning === 'stale-device' && <p className="encryption-caution">{languageHint(t, `Пропущено устаревших устройств: ${conversation.encryption.skippedDevices ?? 1}.`, `Skipped stale devices: ${conversation.encryption.skippedDevices ?? 1}.`)}</p>}
+              {encryptionPolicy !== 'plaintext' && (
+                <details className="device-details">
+                  <summary>{languageHint(t, `Устройства (${conversation.encryption?.devices.length ?? 0})`, `Devices (${conversation.encryption?.devices.length ?? 0})`)}</summary>
+                  <div className="device-list">
+                    {conversation.encryption?.devices.length === 0 && <p>{languageHint(t, 'Устройства появятся после первой защищённой отправки.', 'Devices appear after the first encrypted send.')}</p>}
+                    {conversation.encryption?.devices.map((device) => (
+                      <article className={device.changedAt ? 'changed' : ''} key={device.id}>
+                        <div><strong>{device.label}</strong>{device.changedAt && <em>{languageHint(t, 'Ключ изменился', 'Key changed')}</em>}<code>{device.fingerprint || languageHint(t, 'Отпечаток недоступен', 'Fingerprint unavailable')}</code></div>
+                        <button type="button" className={device.trust === 'trusted' ? 'trusted' : ''} disabled={!device.fingerprint} onClick={() => void setDeviceTrust(profile.id, conversation.id, device.id, device.trust !== 'trusted')}>{device.trust === 'trusted' ? languageHint(t, 'Проверено', 'Verified') : languageHint(t, 'Доверять', 'Trust')}</button>
+                      </article>
+                    ))}
+                  </div>
+                </details>
+              )}
+            </section>
+          )}
+        </div>
+        {identities.length > 1 && <select className="identity-selector" aria-label={languageHint(t, 'Отправить от имени', 'Send as')} value={sourceId} onChange={(event) => void setSource(profile.id, conversation.id, event.target.value)} required><option value="" disabled>{languageHint(t, 'Выберите аккаунт', 'Choose account')}</option>{identities.map((identity) => <option key={identity.id} value={identity.id}>{identity.alias}</option>)}</select>}
+        <textarea rows={1} value={body} onChange={(event) => setBody(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} onBlur={() => void saveDraft(profile.id, conversation.id, body)} placeholder={sourceId ? languageHint(t, 'Сообщение', 'Message') : languageHint(t, 'Сначала выберите аккаунт', 'Choose an account first')} maxLength={conversation.protocol === 'tox' ? TOX_MESSAGE_MAX_BYTES : XMPP_MESSAGE_MAX_BYTES}/>
+        <button className="send-message" type="submit" title={t.send} aria-label={t.send} disabled={!sourceId || !body.trim()}><SendIcon/></button>
+      </form>
+    </>
+  );
+}
+
+function ActiveChatLegacy({ profile, conversation, messages, onBack, send, retry, setSource, saveDraft, setDeviceTrust, setEncryptionPolicy, t }: ActiveChatProps) {
   const [body, setBody] = useState(profile.drafts[conversation.id] ?? '');
   const [securityOpen, setSecurityOpen] = useState(false);
   const [visibleCount, setVisibleCount] = useState(MESSAGE_RENDER_BATCH);
@@ -974,6 +1100,8 @@ function ActiveChat({ profile, conversation, messages, onBack, send, retry, setS
   const encryptionPolicy = conversation.encryption?.policy ?? 'secure-auto';
   return <><div className="chat-head"><button className="back-button" onClick={onBack} aria-label={languageHint(t, 'Назад', 'Back')}><ArrowIcon/></button><span className="chat-avatar">{conversation.title.slice(0, 2).toUpperCase()}</span><div className="chat-head-copy"><h2>{conversation.title}</h2><small>{presenceLabel(contact?.presence ?? 'offline', t)}</small></div>{conversation.protocol === 'xmpp' ? <button className={`security-state ${security.tone}`} onClick={() => setSecurityOpen((open) => !open)} aria-expanded={securityOpen}>{securityBadge}</button> : <span className={`security-state ${security.tone}`}>{securityBadge}</span>}</div>{securityOpen && conversation.protocol === 'xmpp' && <section className="security-sheet" role="dialog" aria-label={languageHint(t, 'Настройки шифрования', 'Encryption settings')}><div className="security-sheet-head"><div><strong>{languageHint(t, 'Шифрование чата', 'Chat encryption')}</strong><small>{languageHint(t, 'OMEMO скрывает текст от сервера. TLS подходит клиентам без OMEMO.', 'OMEMO hides text from the server. TLS works with clients that do not support OMEMO.')}</small></div><button onClick={() => setSecurityOpen(false)} aria-label={languageHint(t, 'Закрыть', 'Close')}>×</button></div><div className="encryption-modes"><button className={encryptionPolicy === 'secure-auto' ? 'active' : ''} onClick={() => void setEncryptionPolicy(profile.id, conversation.id, 'secure-auto')}>{languageHint(t, 'Авто', 'Auto')}</button><button className={encryptionPolicy === 'force-omemo' ? 'active' : ''} onClick={() => void setEncryptionPolicy(profile.id, conversation.id, 'force-omemo')}>OMEMO</button><button className={encryptionPolicy === 'plaintext' ? 'active warning' : ''} onClick={() => void setEncryptionPolicy(profile.id, conversation.id, 'plaintext')}>TLS</button></div>{encryptionPolicy === 'plaintext' ? <p className="encryption-warning">{languageHint(t, 'Текст сможет прочитать XMPP-сервер. Выберите этот режим только для контактов без OMEMO.', 'The XMPP server can read message text. Use this only for contacts without OMEMO.')}</p> : <>{conversation.encryption?.warning === 'stale-device' && <p className="encryption-caution">{languageHint(t, `Пропущено устаревших устройств: ${conversation.encryption.skippedDevices ?? 1}. Сообщение зашифровано для остальных устройств.`, `Skipped stale devices: ${conversation.encryption.skippedDevices ?? 1}. The message was encrypted for the remaining devices.`)}</p>}{conversation.encryption?.devices.length === 0 ? <p>{languageHint(t, 'Устройства OMEMO появятся после первой защищённой отправки.', 'OMEMO devices will appear after the first encrypted send.')}</p> : conversation.encryption?.devices.map((device) => <article className={device.changedAt ? 'changed' : ''} key={device.id}><div><strong>{device.label}</strong>{device.changedAt && <em>{languageHint(t, 'Ключ изменился', 'Key changed')}</em>}<code>{device.fingerprint || languageHint(t, 'Отпечаток недоступен', 'Fingerprint unavailable')}</code></div><button className={device.trust === 'trusted' ? 'trusted' : ''} disabled={!device.fingerprint} onClick={() => void setDeviceTrust(profile.id, conversation.id, device.id, device.trust !== 'trusted')}>{device.trust === 'trusted' ? languageHint(t, 'Проверено', 'Verified') : languageHint(t, 'Доверять', 'Trust')}</button></article>)}</>}</section>}<div className="messages">{messages.length === 0 && <div className="conversation-start"><strong>{conversation.title}</strong><span>{security.label}</span><p>{languageHint(t, 'Напишите первое сообщение.', 'Write the first message.')}</p></div>}{hiddenMessageCount > 0 && <button className="load-older" onClick={() => setVisibleCount((count) => count + MESSAGE_RENDER_BATCH)}>{languageHint(t, `Показать ещё ${Math.min(hiddenMessageCount, MESSAGE_RENDER_BATCH)}`, `Show ${Math.min(hiddenMessageCount, MESSAGE_RENDER_BATCH)} more`)}</button>}{visibleMessages.map((message) => <article key={message.id} className={`${message.direction} ${message.delivery === 'failed' ? 'failed' : ''}`}><p>{message.body}<span className="message-meta"><time>{formatTime(message.timestamp)}</time>{message.direction === 'outgoing' && <MessageDelivery state={message.delivery} t={t}/>}</span></p>{message.direction === 'outgoing' && message.delivery === 'failed' && <button className="retry-message" onClick={() => void retry(profile.id, conversation, message)}>{languageHint(t, 'Повторить', 'Retry')}</button>}</article>)}<div className="message-anchor" ref={messagesEnd}/></div><form className="composer" onSubmit={(event) => { event.preventDefault(); const value = body.trim(); if (!value || !sourceId) return; setBody(''); void send(profile.id, conversation, value, sourceId).catch(() => setBody(value)); }}>{identities.length > 1 && <select className="identity-selector" aria-label={languageHint(t, 'Отправить от имени', 'Send as')} value={sourceId} onChange={(event) => void setSource(profile.id, conversation.id, event.target.value)} required><option value="" disabled>{languageHint(t, 'Выберите аккаунт', 'Choose account')}</option>{identities.map((identity) => <option key={identity.id} value={identity.id}>{identity.alias}</option>)}</select>}<textarea rows={1} value={body} onChange={(event) => setBody(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} onBlur={() => void saveDraft(profile.id, conversation.id, body)} placeholder={sourceId ? languageHint(t, 'Сообщение', 'Message') : languageHint(t, 'Сначала выберите аккаунт', 'Choose an account first')} maxLength={conversation.protocol === 'tox' ? TOX_MESSAGE_MAX_BYTES : XMPP_MESSAGE_MAX_BYTES}/><button type="submit" title={t.send} aria-label={t.send} disabled={!sourceId || !body.trim()}><SendIcon/></button></form></>;
 }
+
+void ActiveChatLegacy;
 
 function Accounts({ profile, addXmpp, connectXmpp, addTox, connectTox, disconnectAccount, removeAccount, exportAccount, t }: { profile: LocalProfile; addXmpp: (account: Account) => Promise<void>; connectXmpp: (account: Account) => void; addTox: (alias: string, savedata?: string) => Promise<void>; connectTox: (account: Account) => Promise<ToxClient>; disconnectAccount: (account: Account) => Promise<void>; removeAccount: (account: Account) => Promise<void>; exportAccount: (account: Account) => Promise<void>; t: typeof copy[Language] }) {
   const [kind, setKind] = useState<'xmpp' | 'tox'>('xmpp');

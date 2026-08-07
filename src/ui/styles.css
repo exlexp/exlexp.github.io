@@ -36,8 +36,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--chat-blue); box-
 ::selection { background: color-mix(in srgb, var(--chat-blue) 22%, transparent); }
 * { scrollbar-width: thin; scrollbar-color: #c9d1d8 transparent; }
 
-.boot { min-height: 100vh; display: grid; place-content: center; color: var(--chat-muted); }
-.pulse { width: 8px; height: 8px; display: inline-block; border-radius: 50%; background: var(--chat-blue); }
+.boot { min-height: 100vh; background: #fff; }
 
 .app-shell { height: 100vh; min-height: 560px; overflow: hidden; background: var(--chat-paper); }
 .app-grid { height: 100%; display: grid; grid-template-columns: 78px minmax(0, 1fr); }
@@ -108,7 +107,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--chat-blue); box-
 .conversation-meta b { min-width: 20px; height: 20px; padding: 0 6px; display: grid; place-content: center; border-radius: 11px; background: var(--chat-blue); color: #fff; font-size: 11px; }
 .selected .conversation-meta b { background: #fff; color: var(--chat-blue); }
 
-.chat-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--chat-canvas); }
+.chat-panel { position: relative; min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--chat-canvas); }
 .chat-idle { flex: 1; display: grid; place-content: center; justify-items: center; text-align: center; color: var(--chat-muted); }
 .chat-idle strong { color: #53606d; font-size: 15px; }
 .chat-idle p { margin: 7px 0 0; font-size: 13px; }
@@ -175,9 +174,40 @@ button.security-state { border: 0; font: inherit; cursor: pointer; }
 .conversation-start strong { color: #53606d; }
 .conversation-start span { margin-top: 5px; color: var(--chat-green); font-size: 11px; font-weight: 650; }
 .conversation-start p { margin: 8px 0 0; font-size: 13px; }
-.composer { flex: 0 0 auto; min-height: 64px; padding: 9px 12px; display: flex; align-items: flex-end; gap: 8px; border-top: 1px solid var(--chat-line); background: #fff; }
+.composer { position: relative; flex: 0 0 auto; min-height: 64px; padding: 9px 12px; display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--chat-line); background: #fff; }
 .composer textarea { min-height: 44px; max-height: 130px; padding: 11px 14px; resize: none; border: 0; border-radius: 22px; background: var(--chat-search); line-height: 22px; }
-.composer button { width: 44px; height: 44px; flex: 0 0 auto; display: grid; place-content: center; border: 0; border-radius: 50%; background: var(--chat-blue); color: #fff; cursor: pointer; }
+.composer > .send-message { width: 44px; height: 44px; flex: 0 0 auto; display: grid; place-content: center; border: 0; border-radius: 50%; background: var(--chat-blue); color: #fff; cursor: pointer; }
+.composer > .send-message:disabled { opacity: .45; cursor: default; }
+.composer-security-wrap { position: relative; flex: 0 0 auto; }
+.composer-security { width: 76px; height: 36px; padding: 0 10px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 0; border-radius: 18px; background: #edf2f5; color: #64727e; font-size: 11px; font-weight: 700; cursor: default; white-space: nowrap; }
+button.composer-security { cursor: pointer; }
+.composer-security:hover, .composer-security[aria-expanded="true"] { background: #e5edf3; color: #43525e; }
+.composer-security.secure { background: #eaf7ee; color: #2f8555; }
+.composer-security.warning { background: #fff4e2; color: #8b611f; }
+.composer-security svg { width: 14px; height: 14px; flex: 0 0 auto; }
+.security-popover { position: absolute; z-index: 20; bottom: calc(100% + 10px); left: 0; width: min(330px, calc(100vw - 88px)); padding: 10px; border: 1px solid rgba(43, 64, 82, .12); border-radius: 14px; background: #fff; box-shadow: 0 12px 34px rgba(30, 49, 64, .18); }
+.security-popover::after { content: ""; position: absolute; left: 27px; bottom: -5px; width: 10px; height: 10px; border-right: 1px solid rgba(43, 64, 82, .12); border-bottom: 1px solid rgba(43, 64, 82, .12); background: #fff; transform: rotate(45deg); }
+.security-popover-title { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 2px 3px 9px; }
+.security-popover-title strong { font-size: 13px; }
+.security-popover-title small { color: var(--chat-muted); font-size: 10px; }
+.encryption-options { display: grid; gap: 3px; }
+.encryption-options > button { width: 100%; min-height: 44px; padding: 7px 10px; display: grid; grid-template-columns: 72px minmax(0, 1fr); align-items: center; gap: 8px; border: 0; border-radius: 9px; background: transparent; color: #334350; text-align: left; cursor: pointer; }
+.encryption-options > button:hover { background: #f3f6f8; }
+.encryption-options > button.active { background: var(--chat-blue-soft); color: var(--chat-blue); }
+.encryption-options > button.active.warning { background: #fff4e2; color: #8b611f; }
+.encryption-options strong { font-size: 12px; }
+.encryption-options small { color: var(--chat-muted); font-size: 11px; }
+.device-details { margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--chat-line); }
+.device-details summary { padding: 5px 3px; color: #53616d; font-size: 11px; font-weight: 650; cursor: pointer; }
+.device-list { max-height: 190px; overflow: auto; }
+.device-list > p { margin: 5px 3px; color: var(--chat-muted); font-size: 11px; line-height: 1.4; }
+.device-list article { display: flex; align-items: center; gap: 8px; padding: 8px 3px; border-top: 1px solid #edf0f2; }
+.device-list article > div { min-width: 0; flex: 1; }
+.device-list article strong { font-size: 11px; }
+.device-list article em { margin-left: 6px; color: var(--chat-danger); font-size: 10px; font-style: normal; }
+.device-list code { display: block; margin-top: 3px; color: #667480; font-size: 9px; overflow-wrap: anywhere; }
+.device-list article > button { min-width: 68px; padding: 6px 8px; border: 1px solid #d7dfe5; border-radius: 8px; background: #fff; color: #4b5b68; font-size: 10px; font-weight: 650; cursor: pointer; }
+.device-list article > button.trusted { border-color: #b9dfc6; background: #ebf7ef; color: #2f8555; }
 .composer button:hover { background: var(--chat-blue-hover); }
 .composer button:disabled { opacity: .45; cursor: default; }
 .composer button svg { width: 19px; }

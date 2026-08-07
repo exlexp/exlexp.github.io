@@ -49,13 +49,53 @@ describe('XMPP client contact flow', () => {
     expect(sent[0]).not.toContain('<body>');
   });
 
+  it('adds the fixed compatibility body used by Dino for legacy OMEMO', () => {
+    const sent: string[] = [];
+    const client = new XmppClient();
+    const harness = client as unknown as { bound: boolean; socket: { readyState: number; send(value: string): void } };
+    harness.bound = true;
+    harness.socket = { readyState: WebSocket.OPEN, send: (value) => sent.push(value) };
+    client.sendEncryptedMessage('friend@example.org', '<encrypted xmlns="eu.siacs.conversations.axolotl"/>', 'eu.siacs.conversations.axolotl');
+    expect(sent[0]).toContain('namespace="eu.siacs.conversations.axolotl"');
+    expect(sent[0]).toContain('<body>[This message is OMEMO encrypted]</body>');
+  });
+
   it('updates OMEMO device lists from PEP pushes', async () => {
     const client = new XmppClient();
     const events: unknown[] = [];
     client.subscribe((event) => events.push(event));
     const harness = client as unknown as { handleFrame(xml: string): Promise<void> };
     await harness.handleFrame('<message from="friend@example.org" type="headline"><event xmlns="http://jabber.org/protocol/pubsub#event"><items node="urn:xmpp:omemo:2:devices"><item id="current"><devices xmlns="urn:xmpp:omemo:2"><device id="7"/><device id="11"/></devices></item></items></event></message>');
-    expect(events).toContainEqual({ type: 'omemo-devices', from: 'friend@example.org', deviceIds: [7, 11] });
+    expect(events).toContainEqual({ type: 'omemo-devices', from: 'friend@example.org', namespace: 'urn:xmpp:omemo:2', deviceIds: [7, 11] });
+  });
+
+  it('parses Dino-compatible legacy OMEMO device notifications', async () => {
+    const client = new XmppClient();
+    const events: unknown[] = [];
+    client.subscribe((event) => events.push(event));
+    const harness = client as unknown as { handleFrame(xml: string): Promise<void> };
+    await harness.handleFrame('<message from="friend@example.org" type="headline"><event xmlns="http://jabber.org/protocol/pubsub#event"><items node="eu.siacs.conversations.axolotl.devicelist"><item id="current"><list xmlns="eu.siacs.conversations.axolotl"><device id="23"/></list></item></items></event></message>');
+    expect(events).toContainEqual({ type: 'omemo-devices', from: 'friend@example.org', namespace: 'eu.siacs.conversations.axolotl', deviceIds: [23] });
+  });
+
+  it('extracts a Dino-style legacy OMEMO envelope addressed to this device', async () => {
+    const client = new XmppClient();
+    const events: unknown[] = [];
+    client.subscribe((event) => events.push(event));
+    client.setOmemoDeviceId(23);
+    const harness = client as unknown as {
+      credentials: { jid: string };
+      handleFrame(xml: string): Promise<void>;
+    };
+    harness.credentials = { jid: 'me@example.org' };
+    await harness.handleFrame('<message from="friend@example.org/dino" to="me@example.org/relayless" type="chat" id="dino-1"><encrypted xmlns="eu.siacs.conversations.axolotl"><header sid="71"><key rid="23" prekey="true">a2V5</key><iv>aXY=</iv></header><payload>Y2lwaGVydGV4dA==</payload></encrypted><body>[This message is OMEMO encrypted]</body></message>');
+    expect(events).toContainEqual({
+      type: 'encrypted-message', id: 'dino-1', from: 'friend@example.org', timestamp: expect.any(Number), archived: false,
+      payload: {
+        namespace: 'eu.siacs.conversations.axolotl', senderDeviceId: 71, encryptedKey: 'a2V5', keyExchange: true,
+        ciphertext: 'Y2lwaGVydGV4dA==', iv: 'aXY=',
+      },
+    });
   });
 
   it('removes a roster contact and both subscription directions', () => {

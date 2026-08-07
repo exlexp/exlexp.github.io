@@ -7,11 +7,18 @@ import { parseXmppElement } from '../protocols/xmpp/xml';
 import { OmemoEngine, OmemoUnavailableError } from './omemo';
 
 class PepServer {
-  private readonly devices = new Map<string, string>();
-  private readonly bundles = new Map<string, string>();
+  private readonly items = new Map<string, string>();
 
   setDevices(jid: string, ids: number[]): void {
-    this.devices.set(jid, `<devices xmlns="urn:xmpp:omemo:2">${ids.map((id) => `<device id="${id}"/>`).join('')}</devices>`);
+    this.items.set(this.key(jid, 'urn:xmpp:omemo:2:devices', 'current'), `<devices xmlns="urn:xmpp:omemo:2">${ids.map((id) => `<device id="${id}"/>`).join('')}</devices>`);
+  }
+
+  removeNode(jid: string, node: string): void {
+    for (const key of this.items.keys()) if (key.startsWith(`${jid}\u0000${node}\u0000`)) this.items.delete(key);
+  }
+
+  private key(jid: string, node: string, id: string): string {
+    return `${jid}\u0000${node}\u0000${id}`;
   }
 
   client(jid: string): XmppClient {
@@ -26,16 +33,22 @@ class PepServer {
           const content = item?.firstElementChild;
           if (!content) throw new Error('empty PEP publication');
           const serialized = new XMLSerializer().serializeToString(content);
-          if (node === 'urn:xmpp:omemo:2:devices') this.devices.set(jid, serialized);
-          else if (node === 'urn:xmpp:omemo:2:bundles') this.bundles.set(`${jid}:${item.getAttribute('id')}`, serialized);
+          this.items.set(this.key(jid, node ?? '', item.getAttribute('id') ?? 'current'), serialized);
           return parseXmppElement('<iq type="result"/>');
         }
         const target = options?.to ?? jid;
         const items = root.getElementsByTagNameNS('http://jabber.org/protocol/pubsub', 'items')[0];
         const node = items?.getAttribute('node');
         const id = items?.getElementsByTagNameNS('http://jabber.org/protocol/pubsub', 'item')[0]?.getAttribute('id');
-        const value = node === 'urn:xmpp:omemo:2:devices' ? this.devices.get(target) : this.bundles.get(`${target}:${id}`);
-        return parseXmppElement(`<iq type="result"><pubsub xmlns="http://jabber.org/protocol/pubsub"><items node="${node}">${value ? `<item id="${id ?? 'current'}">${value}</item>` : ''}</items></pubsub></iq>`);
+        const matched = id
+          ? { itemId: id, value: this.items.get(this.key(target, node ?? '', id)) }
+          : Array.from(this.items.entries())
+            .map(([key, value]) => ({ parts: key.split('\u0000'), value }))
+            .filter((entry) => entry.parts[0] === target && entry.parts[1] === node)
+            .map((entry) => ({ itemId: entry.parts[2] ?? 'current', value: entry.value }))[0];
+        const itemId = matched?.itemId;
+        const value = matched?.value;
+        return parseXmppElement(`<iq type="result"><pubsub xmlns="http://jabber.org/protocol/pubsub"><items node="${node}">${value ? `<item id="${itemId ?? 'current'}">${value}</item>` : ''}</items></pubsub></iq>`);
       },
     } as unknown as XmppClient;
   }
@@ -43,13 +56,21 @@ class PepServer {
 
 function wirePayload(xml: string, ownJid: string, ownDeviceId: number): XmppOmemoPayload {
   const encrypted = parseXmppElement(xml);
-  const header = encrypted.getElementsByTagNameNS('urn:xmpp:omemo:2', 'header')[0]!;
-  const keys = Array.from(encrypted.getElementsByTagNameNS('urn:xmpp:omemo:2', 'keys')).find((element) => element.getAttribute('jid') === ownJid)!;
-  const key = Array.from(keys.getElementsByTagNameNS('urn:xmpp:omemo:2', 'key')).find((element) => Number(element.getAttribute('rid')) === ownDeviceId)!;
-  const payload = encrypted.getElementsByTagNameNS('urn:xmpp:omemo:2', 'payload')[0]!;
+  const namespace = encrypted.namespaceURI as XmppOmemoPayload['namespace'];
+  const header = encrypted.getElementsByTagNameNS(namespace, 'header')[0]!;
+  const keyRoot = namespace === 'urn:xmpp:omemo:2'
+    ? Array.from(encrypted.getElementsByTagNameNS(namespace, 'keys')).find((element) => element.getAttribute('jid') === ownJid)!
+    : header;
+  const key = Array.from(keyRoot.getElementsByTagNameNS(namespace, 'key')).find((element) => Number(element.getAttribute('rid')) === ownDeviceId)!;
+  const payload = encrypted.getElementsByTagNameNS(namespace, 'payload')[0]!;
   return {
-    namespace: 'urn:xmpp:omemo:2', senderDeviceId: Number(header.getAttribute('sid')),
-    encryptedKey: key.textContent ?? '', keyExchange: key.getAttribute('kex') === 'true', ciphertext: payload.textContent ?? '',
+    namespace, senderDeviceId: Number(header.getAttribute('sid')),
+    encryptedKey: key.textContent ?? '',
+    keyExchange: namespace === 'urn:xmpp:omemo:2' ? key.getAttribute('kex') === 'true' : key.getAttribute('prekey') === 'true',
+    ciphertext: payload.textContent ?? '',
+    iv: namespace === 'eu.siacs.conversations.axolotl'
+      ? header.getElementsByTagNameNS(namespace, 'iv')[0]?.textContent ?? undefined
+      : undefined,
   };
 }
 
@@ -100,5 +121,33 @@ describe('OMEMO engine', () => {
     pep.setDevices('bob@example.test', [424242]);
 
     await expect(alice.encrypt('bob@example.test', 'must not leak')).rejects.toBeInstanceOf(OmemoUnavailableError);
+  }, 30_000);
+
+  it('interoperates bidirectionally with a Dino-style legacy-only OMEMO peer', async () => {
+    const dom = new JSDOM('');
+    Object.assign(globalThis, { DOMParser: dom.window.DOMParser, XMLSerializer: dom.window.XMLSerializer });
+    const pep = new PepServer();
+    let aliceState: OmemoAccountState | undefined;
+    let bobState: OmemoAccountState | undefined;
+    const alice = await OmemoEngine.open(pep.client('alice@example.test'), 'alice@example.test', undefined, async (state) => { aliceState = state; });
+    const bob = await OmemoEngine.open(pep.client('bob@example.test'), 'bob@example.test', undefined, async (state) => { bobState = state; });
+    await alice.announce();
+    await bob.announce();
+    pep.removeNode('alice@example.test', 'urn:xmpp:omemo:2:devices');
+    pep.removeNode('bob@example.test', 'urn:xmpp:omemo:2:devices');
+
+    const outbound = await alice.encrypt('bob@example.test', 'hello Dino');
+    expect(outbound.namespace).toBe('eu.siacs.conversations.axolotl');
+    expect(outbound.xml).toContain('prekey="true"');
+    expect(outbound.xml).not.toContain('hello Dino');
+    await expect(bob.decrypt('alice@example.test', wirePayload(outbound.xml, 'bob@example.test', bob.deviceId)))
+      .resolves.toMatchObject({ body: 'hello Dino' });
+
+    const reply = await bob.encrypt('alice@example.test', 'hello Relayless');
+    expect(reply.namespace).toBe('eu.siacs.conversations.axolotl');
+    await expect(alice.decrypt('bob@example.test', wirePayload(reply.xml, 'alice@example.test', alice.deviceId)))
+      .resolves.toMatchObject({ body: 'hello Relayless' });
+    expect(aliceState?.legacyStore).toBeTruthy();
+    expect(bobState?.legacyStore).toBeTruthy();
   }, 30_000);
 });

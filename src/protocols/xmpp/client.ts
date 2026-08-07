@@ -14,6 +14,7 @@ export interface XmppCredentials {
 }
 
 export type XmppState = 'offline' | 'connecting' | 'authenticating' | 'online' | 'reconnecting' | 'error';
+export type XmppOmemoNamespace = 'urn:xmpp:omemo:2' | 'eu.siacs.conversations.axolotl';
 
 export type XmppEvent =
   | { type: 'state'; state: XmppState; detail?: string }
@@ -23,17 +24,18 @@ export type XmppEvent =
   | { type: 'message-error'; id: string; from: string; detail: string }
   | { type: 'presence'; from: string; show: string }
   | { type: 'chat-state'; from: string; state: 'active' | 'composing' | 'paused' | 'inactive' | 'gone' }
-  | { type: 'omemo-devices'; from: string; deviceIds: number[] }
+  | { type: 'omemo-devices'; from: string; namespace: XmppOmemoNamespace; deviceIds: number[] }
   | { type: 'roster'; contacts: Array<{ jid: string; name: string }> };
 
 type Listener = (event: XmppEvent) => void;
 
 export interface XmppOmemoPayload {
-  namespace: 'urn:xmpp:omemo:2';
+  namespace: XmppOmemoNamespace;
   senderDeviceId: number;
   encryptedKey: string;
   keyExchange: boolean;
   ciphertext: string;
+  iv?: string;
 }
 
 interface PendingIq {
@@ -119,13 +121,17 @@ export class XmppClient {
     });
   }
 
-  sendEncryptedMessage(to: string, encryptedXml: string): string {
+  sendEncryptedMessage(to: string, encryptedXml: string, namespace: XmppOmemoNamespace = 'urn:xmpp:omemo:2'): string {
     if (!this.bound || this.socket?.readyState !== WebSocket.OPEN) throw new Error('XMPP account is offline');
     const id = crypto.randomUUID();
+    const legacyFallback = namespace === 'eu.siacs.conversations.axolotl'
+      ? '<body>[This message is OMEMO encrypted]</body>'
+      : '';
     this.send(
       `<message to="${escapeXml(to)}" type="chat" id="${id}">` +
         encryptedXml +
-        `<encryption xmlns="urn:xmpp:eme:0" namespace="urn:xmpp:omemo:2"/>` +
+        legacyFallback +
+        `<encryption xmlns="urn:xmpp:eme:0" namespace="${namespace}"/>` +
         `<origin-id xmlns="urn:xmpp:sid:0" id="${id}"/>` +
         `<store xmlns="urn:xmpp:hints"/>` +
         `<request xmlns="urn:xmpp:receipts"/>` +
@@ -348,14 +354,17 @@ export class XmppClient {
       this.emit({ type: 'message-error', id: stableMessageId(message), from: bareJid(message.getAttribute('from') ?? ''), detail: `XMPP delivery failed${condition ? `: ${condition.localName}` : ''}` });
       return;
     }
-    const omemoDevices = descendants(message, 'items').find((item) =>
-      item.namespaceURI === 'http://jabber.org/protocol/pubsub#event' && item.getAttribute('node') === 'urn:xmpp:omemo:2:devices');
+    const omemoDevices = descendants(message, 'items').find((item) => item.namespaceURI === 'http://jabber.org/protocol/pubsub#event' &&
+      ['urn:xmpp:omemo:2:devices', 'eu.siacs.conversations.axolotl.devicelist'].includes(item.getAttribute('node') ?? ''));
     if (omemoDevices) {
+      const namespace: XmppOmemoNamespace = omemoDevices.getAttribute('node') === 'urn:xmpp:omemo:2:devices'
+        ? 'urn:xmpp:omemo:2'
+        : 'eu.siacs.conversations.axolotl';
       const deviceIds = descendants(omemoDevices, 'device')
-        .filter((device) => device.namespaceURI === 'urn:xmpp:omemo:2')
+        .filter((device) => device.namespaceURI === namespace)
         .map((device) => Number(device.getAttribute('id')))
         .filter((id) => Number.isInteger(id) && id > 0 && id <= 0x7fffffff);
-      this.emit({ type: 'omemo-devices', from: bareJid(message.getAttribute('from') ?? ''), deviceIds: [...new Set(deviceIds)] });
+      this.emit({ type: 'omemo-devices', from: bareJid(message.getAttribute('from') ?? ''), namespace, deviceIds: [...new Set(deviceIds)] });
       return;
     }
     const forwarded = descendants(message, 'forwarded').find((item) => item.namespaceURI === 'urn:xmpp:forward:0');
@@ -382,12 +391,16 @@ export class XmppClient {
   }
 
   private emitMessage(message: Element, timestamp: number, archived: boolean): string | undefined {
-    const encrypted = descendants(message, 'encrypted').find((item) => item.namespaceURI === 'urn:xmpp:omemo:2');
+    const encrypted = descendants(message, 'encrypted').find((item) =>
+      item.namespaceURI === 'urn:xmpp:omemo:2' || item.namespaceURI === 'eu.siacs.conversations.axolotl');
     if (encrypted) {
       const header = firstDescendant(encrypted, 'header');
       const payload = firstDescendant(encrypted, 'payload');
       const ownJid = bareJid(this.credentials?.jid ?? '');
-      const keyGroup = descendants(header ?? encrypted, 'keys').find((item) => bareJid(item.getAttribute('jid') ?? '') === ownJid);
+      const namespace = encrypted.namespaceURI as XmppOmemoNamespace;
+      const keyGroup = namespace === 'urn:xmpp:omemo:2'
+        ? descendants(header ?? encrypted, 'keys').find((item) => bareJid(item.getAttribute('jid') ?? '') === ownJid)
+        : header;
       const ownDeviceId = Number(this.omemoDeviceId);
       const key = descendants(keyGroup ?? encrypted, 'key').find((item) => Number(item.getAttribute('rid')) === ownDeviceId);
       const senderDeviceId = Number(header?.getAttribute('sid'));
@@ -397,10 +410,13 @@ export class XmppClient {
           type: 'encrypted-message', id, from: bareJid(message.getAttribute('from') ?? ''),
           timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(), archived,
           payload: {
-            namespace: 'urn:xmpp:omemo:2', senderDeviceId,
+            namespace, senderDeviceId,
             encryptedKey: key.textContent?.trim() ?? '',
-            keyExchange: key.getAttribute('kex') === 'true' || key.getAttribute('kex') === '1',
+            keyExchange: namespace === 'urn:xmpp:omemo:2'
+              ? key.getAttribute('kex') === 'true' || key.getAttribute('kex') === '1'
+              : key.getAttribute('prekey') === 'true' || key.getAttribute('prekey') === '1',
             ciphertext: payload.textContent?.trim() ?? '',
+            iv: namespace === 'eu.siacs.conversations.axolotl' ? firstDescendant(header ?? encrypted, 'iv')?.textContent?.trim() : undefined,
           },
         });
         return id;

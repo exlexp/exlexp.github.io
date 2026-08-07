@@ -134,6 +134,9 @@ export interface OmemoAccountState {
   signedPreKeyId: number;
   signedPreKeySignature: string;
   store: Record<string, OmemoStoredValue>;
+  legacySignedPreKeyId?: number;
+  legacySignedPreKeySignature?: string;
+  legacyStore?: Record<string, OmemoStoredValue>;
 }
 
 export interface LocalProfile {
