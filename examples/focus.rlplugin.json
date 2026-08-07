@@ -1,0 +1,15 @@
+{
+  "apiVersion": 1,
+  "id": "app.relayless.focus",
+  "name": "Быстрый переход к чатам",
+  "version": "1.0.0",
+  "description": "Добавляет в палитру команд быстрый переход к списку чатов.",
+  "permissions": ["commands"],
+  "commands": [
+    {
+      "id": "open-chats",
+      "title": "Открыть чаты",
+      "action": "open-chats"
+    }
+  ]
+}

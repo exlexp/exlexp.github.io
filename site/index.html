@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark"><title>Relayless — local-first messenger</title>
+  <style>body{margin:0;background:#050505;color:#f4f4ef;font:16px system-ui,sans-serif}main{max-width:920px;margin:8vh auto;padding:32px;border:1px solid #d8d8d2}h1{font-size:clamp(44px,8vw,86px);letter-spacing:-.06em;line-height:.95;margin:20px 0}p{color:#aaa;line-height:1.65;max-width:680px}.tag{font:11px monospace;color:#a8ff60;letter-spacing:.14em}section{border-top:1px solid #353535;margin-top:44px;padding-top:22px}a{color:#f4f4ef}code{font-family:monospace;color:#a8ff60}</style>
+</head>
+<body><main><span class="tag">ISOLATED WEB APP / NO DEVELOPER BACKEND</span><h1>Messages without our middleman.</h1><p>Relayless connects an installed Chrome IWA directly to a user-selected XMPP provider and, when the audited WASM adapter is complete, the public Tox network. We run no account, proxy, analytics, logging, relay, or message server.</p><section><h2>Install</h2><p>Requires current Chrome with the applicable IWA unmanaged or enterprise installation policy. Download the Signed Web Bundle from GitHub Releases, verify its SHA-256 checksum and signature, then install it through Chrome's IWA flow.</p></section><section><h2>Privacy</h2><p>Profiles, credentials, contacts, and history are encrypted locally. Third-party XMPP providers and Tox participants still see the metadata inherent to those protocols. There are no cookies, forms, trackers, or runtime CDN requests on this page.</p></section><section><h2>Verify</h2><p>Compare <code>sha256sum relayless.swbn</code> with <code>SHA256SUMS</code>, inspect the bundle with <code>wbn-sign info</code>, and review the published source at the matching tag.</p></section></main></body>
+</html>

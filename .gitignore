@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+vendor/
+*.pem
+*.swbn
+*.wbn
+*.rlvault
+.env*
+work/

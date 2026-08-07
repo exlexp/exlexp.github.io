@@ -1,0 +1,46 @@
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  tox-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Emscripten
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build build-essential autoconf automake libtool pkg-config python3 curl xz-utils
+          sudo git clone --depth 1 --branch 4.0.3 https://github.com/emscripten-core/emsdk.git /opt/emsdk
+          sudo chown -R "$USER" /opt/emsdk
+          cd /opt/emsdk
+          ./emsdk install 4.0.3
+          ./emsdk activate 4.0.3
+      - run: sh scripts/build-tox-wasm-wsl.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tox-wasm
+          path: |
+            public/tox/toxcore.mjs
+            public/tox/toxcore.wasm
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run verify
+      - run: npm run bundle:iwa
+      - run: npm run checksums
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-iwa
+          path: |
+            dist/relayless.wbn
+            dist/SHA256SUMS
+          if-no-files-found: error

@@ -1,0 +1,25 @@
+{
+  "name": "Relayless",
+  "short_name": "Relayless",
+  "description": "Local-first Tox and XMPP messenger",
+  "version": "0.1.0",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#3390ec",
+  "lang": "ru",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "permissions_policy": {
+    "cross-origin-isolated": ["self"],
+    "direct-sockets": ["self"]
+  }
+}

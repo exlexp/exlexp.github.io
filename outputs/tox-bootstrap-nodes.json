@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "source": "https://nodes.tox.chat/json",
+  "retrievedAt": "2026-08-06T00:00:00Z",
+  "notice": "Third-party public infrastructure. Enable only nodes you choose to trust.",
+  "nodes": [
+    { "host": "144.217.167.73", "port": 33445, "tcpPorts": [3389, 33445], "publicKey": "7E5668E0EE09E19F320AD47902419331FFEE147BB3606769CFBE921A2A2FD34C", "enabled": true },
+    { "host": "tox.abilinski.com", "port": 33445, "tcpPorts": [], "publicKey": "10C00EB250C3233E343E2AEBA07115A5C28920E9C8D29492F6D00B29049EDC7E", "enabled": true },
+    { "host": "tox1.mf-net.eu", "port": 33445, "tcpPorts": [33445, 3389], "publicKey": "B3E5FA80DC8EBD1149AD2AB35ED8B85BD546DEDE261CA593234C619249419506", "enabled": true },
+    { "host": "3.0.24.15", "port": 33445, "tcpPorts": [33445], "publicKey": "E20ABCF38CDBFFD7D04B29C956B33F7B27A3BB7AF0618101617B036E4AEA402D", "enabled": true },
+    { "host": "172.104.215.182", "port": 33445, "tcpPorts": [443, 33445, 3389], "publicKey": "DA2BD927E01CD05EBCC2574EBE5BEBB10FF59AE0B2105A7D1E2B40E49BB20239", "enabled": true },
+    { "host": "tox.initramfs.io", "port": 33445, "tcpPorts": [3389, 33445], "publicKey": "3F0A45A268367C1BEA652F258C85F4A66DA76BCAA667A49E770BCC4917AB6A25", "enabled": true }
+  ]
+}
