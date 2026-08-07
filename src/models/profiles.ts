@@ -67,9 +67,30 @@ export function normalizeVault(data: VaultData): VaultData {
     profile.ephemeral ??= false;
     profile.pinned ??= false;
     for (const account of profile.accounts) account.connectionState ??= account.presence === 'online' ? 'online' : 'offline';
+    sanitizeMessageHistory(profile);
   });
   if (!data.profiles.some((profile) => profile.id === data.activeProfileId)) data.activeProfileId = data.profiles[0]!.id;
   return data;
+}
+
+function sanitizeMessageHistory(profile: LocalProfile): void {
+  const conversations = new Map(profile.conversations.map((conversation) => [conversation.id, conversation]));
+  const accounts = new Map(profile.accounts.map((account) => [account.id, account]));
+  const exact = (message: LocalProfile['messages'][number]) => [message.conversationId, message.direction, message.body, message.timestamp, message.sourceAccountId ?? ''].join('\u0000');
+  const content = (message: LocalProfile['messages'][number]) => [message.direction, message.body, message.timestamp, message.sourceAccountId ?? ''].join('\u0000');
+  const validCopies = new Set(profile.messages.filter((message) => {
+    const protocol = message.sourceAccountId ? accounts.get(message.sourceAccountId)?.protocol : undefined;
+    return !protocol || conversations.get(message.conversationId)?.protocol === protocol;
+  }).map(content));
+  const seen = new Set<string>();
+  profile.messages = profile.messages.filter((message) => {
+    const duplicateKey = exact(message);
+    if (seen.has(duplicateKey)) return false;
+    seen.add(duplicateKey);
+    const protocol = message.sourceAccountId ? accounts.get(message.sourceAccountId)?.protocol : undefined;
+    const conversationProtocol = conversations.get(message.conversationId)?.protocol;
+    return !protocol || !conversationProtocol || protocol === conversationProtocol || !validCopies.has(content(message));
+  });
 }
 
 export function activeProfile(data: VaultData): LocalProfile {

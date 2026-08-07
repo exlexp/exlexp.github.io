@@ -244,16 +244,16 @@ function handleCoreEvent(event: CoreEvent): void {
       postEvent({ type: 'state', state: selfOnline ? 'online' : 'reconnecting' });
       break;
     case 'friend-connection':
-      postEvent({ type: 'friend-connection', friendNumber: event.friendNumber, online: event.status > 0 });
+      postEvent({ type: 'friend-connection', friendNumber: event.friendNumber, publicKey: friendPublicKey(event.friendNumber), online: event.status > 0 });
       break;
     case 'friend-request':
       postEvent(event);
       break;
     case 'message':
-      postEvent({ type: 'message', friendNumber: event.friendNumber, text: event.text, timestamp: Date.now() });
+      postEvent({ type: 'message', friendNumber: event.friendNumber, publicKey: friendPublicKey(event.friendNumber), text: event.text, timestamp: Date.now() });
       break;
     case 'receipt':
-      postEvent(event);
+      postEvent({ ...event, publicKey: friendPublicKey(event.friendNumber) });
       break;
   }
 }
@@ -290,6 +290,10 @@ function friends(): ToxFriend[] {
       publicKey: readBytes(32, (output) => assertCoreResult(module!._relay_tox_friend_public_key(tox, friendNumber, output), 'Read friend')),
     }));
   } finally { module!._free(pointer); }
+}
+
+function friendPublicKey(friendNumber: number): string {
+  return readBytes(32, (output) => assertCoreResult(module!._relay_tox_friend_public_key(tox, friendNumber, output), 'Read friend'));
 }
 
 function emitSavedata(): void {

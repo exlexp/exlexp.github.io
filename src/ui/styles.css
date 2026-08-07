@@ -58,6 +58,8 @@ input:focus, textarea:focus, select:focus { border-color: var(--chat-blue); box-
 .profile-avatar { width: 40px; height: 40px; transition: transform 160ms cubic-bezier(.2,.8,.3,1); }
 .profile-avatar img, .chat-avatar img { width: 100%; height: 100%; object-fit: cover; }
 .profile-avatar svg { width: 21px; height: 21px; }
+.brand-home .profile-avatar { background: #fff; color: var(--chat-blue); }
+.brand-home .profile-avatar svg { width: 23px; height: 23px; }
 .profile-avatar.large { width: 76px; height: 76px; font-size: 20px; }
 .profile-item > b { position: absolute; top: 7px; right: 7px; min-width: 19px; height: 19px; padding: 0 5px; display: grid; place-content: center; border-radius: 10px; background: var(--chat-blue); color: #fff; font-size: 10px; }
 .profile-rail-actions { margin-top: auto; display: flex; flex-direction: column; }
@@ -137,6 +139,18 @@ button.security-state { border: 0; font: inherit; cursor: pointer; }
 .security-sheet article > button { min-width: 82px; padding: 7px 10px; border: 1px solid #d7dfe5; border-radius: 9px; background: #fff; color: #4b5b68; font-size: 11px; font-weight: 650; cursor: pointer; }
 .security-sheet article > button.trusted { border-color: #b9dfc6; background: #ebf7ef; color: #2f8555; }
 .security-sheet article > button:disabled { opacity: .5; cursor: default; }
+.encryption-modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; padding: 4px; border-radius: 11px; background: #f0f3f5; }
+.encryption-modes button { min-height: 34px; border: 0; border-radius: 8px; background: transparent; color: #64717d; font-size: 12px; font-weight: 650; cursor: pointer; }
+.encryption-modes button.active { background: #fff; color: var(--chat-blue); box-shadow: 0 1px 3px rgba(25, 49, 68, .12); }
+.encryption-modes button.active.warning { color: #9a641c; }
+.encryption-warning { margin: 10px 2px 0; color: #8a622c; font-size: 11px; line-height: 1.45; }
+.context-menu { position: fixed; z-index: 1000; width: 216px; padding: 6px; border: 1px solid rgba(42, 64, 82, .12); border-radius: 12px; background: rgba(255, 255, 255, .98); box-shadow: 0 8px 28px rgba(24, 44, 61, .16); backdrop-filter: blur(14px); animation: context-in 120ms ease-out both; }
+.context-menu button { width: 100%; min-height: 38px; display: flex; align-items: center; gap: 9px; padding: 0 11px; border: 0; border-radius: 8px; background: transparent; color: #273744; font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.context-menu button:hover, .context-menu button:focus-visible { background: #edf5fc; outline: none; }
+.context-menu button.danger { color: #c43d3d; }
+.context-menu button.danger:hover, .context-menu button.danger:focus-visible { background: #fff0f0; }
+.context-menu button:disabled { opacity: .42; cursor: default; background: transparent; }
+@keyframes context-in { from { opacity: 0; transform: translateY(-3px) scale(.98); } to { opacity: 1; transform: none; } }
 .back-button { display: none; width: 34px; height: 34px; place-content: center; border: 0; border-radius: 50%; background: transparent; color: var(--chat-muted); cursor: pointer; }
 .back-button svg { transform: rotate(180deg); width: 18px; }
 .messages { flex: 1; min-height: 0; overflow: auto; padding: 24px clamp(18px, 7vw, 90px); display: flex; flex-direction: column; gap: 7px; }

@@ -17,9 +17,10 @@ export type XmppState = 'offline' | 'connecting' | 'authenticating' | 'online' |
 
 export type XmppEvent =
   | { type: 'state'; state: XmppState; detail?: string }
-  | { type: 'message'; id: string; from: string; body: string; timestamp: number; archived?: boolean }
+  | { type: 'message'; id: string; from: string; body: string; timestamp: number; direction: 'incoming' | 'outgoing'; archived?: boolean }
   | { type: 'encrypted-message'; id: string; from: string; timestamp: number; archived?: boolean; payload: XmppOmemoPayload }
   | { type: 'receipt'; id: string; from: string }
+  | { type: 'message-error'; id: string; from: string; detail: string }
   | { type: 'presence'; from: string; show: string }
   | { type: 'chat-state'; from: string; state: 'active' | 'composing' | 'paused' | 'inactive' | 'gone' }
   | { type: 'roster'; contacts: Array<{ jid: string; name: string }> };
@@ -112,6 +113,7 @@ export class XmppClient {
     this.send(
       `<message to="${escapeXml(to)}" type="chat" id="${id}">` +
         encryptedXml +
+        `<origin-id xmlns="urn:xmpp:sid:0" id="${id}"/>` +
         `<store xmlns="urn:xmpp:hints"/>` +
         `<request xmlns="urn:xmpp:receipts"/>` +
       `</message>`,
@@ -126,9 +128,10 @@ export class XmppClient {
     this.send(
       `<message to="${escapeXml(to)}" type="chat" id="${id}">` +
         `<body>${escapeXml(body)}</body>` +
+        `<origin-id xmlns="urn:xmpp:sid:0" id="${id}"/>` +
         `<active xmlns="http://jabber.org/protocol/chatstates"/>` +
         `<request xmlns="urn:xmpp:receipts"/>` +
-        `<no-store xmlns="urn:xmpp:hints"/><no-permanent-store xmlns="urn:xmpp:hints"/>` +
+        `<store xmlns="urn:xmpp:hints"/>` +
       `</message>`,
     );
     return id;
@@ -144,6 +147,16 @@ export class XmppClient {
     this.send(`<iq type="set" id="${id}"><query xmlns="jabber:iq:roster"><item jid="${escapeXml(bare)}"${label}/></query></iq>`);
     this.send(`<presence to="${escapeXml(bare)}" type="subscribe"/>`);
     return bare;
+  }
+
+  removeContact(jid: string): void {
+    if (!this.bound || this.socket?.readyState !== WebSocket.OPEN) throw new Error('XMPP account is offline');
+    const contact = parseJid(jid.trim());
+    if (!contact.local || !contact.domain) throw new Error('A complete contact JID is required');
+    const bare = `${contact.local}@${contact.domain}`;
+    this.send(`<presence to="${escapeXml(bare)}" type="unsubscribe"/>`);
+    this.send(`<presence to="${escapeXml(bare)}" type="unsubscribed"/>`);
+    this.send(`<iq type="set" id="roster-remove-${crypto.randomUUID()}"><query xmlns="jabber:iq:roster"><item jid="${escapeXml(bare)}" subscription="remove"/></query></iq>`);
   }
 
   setPresence(show?: 'away' | 'dnd'): void {
@@ -316,6 +329,12 @@ export class XmppClient {
   }
 
   private handleMessage(message: Element): void {
+    if (message.getAttribute('type') === 'error') {
+      const error = firstDescendant(message, 'error');
+      const condition = error ? Array.from(error.children).find((child) => child.namespaceURI === 'urn:ietf:params:xml:ns:xmpp-stanzas') : undefined;
+      this.emit({ type: 'message-error', id: stableMessageId(message), from: bareJid(message.getAttribute('from') ?? ''), detail: `XMPP delivery failed${condition ? `: ${condition.localName}` : ''}` });
+      return;
+    }
     const forwarded = descendants(message, 'forwarded').find((item) => item.namespaceURI === 'urn:xmpp:forward:0');
     if (forwarded) {
       const archived = descendants(forwarded, 'message')[0];
@@ -350,7 +369,7 @@ export class XmppClient {
       const key = descendants(keyGroup ?? encrypted, 'key').find((item) => Number(item.getAttribute('rid')) === ownDeviceId);
       const senderDeviceId = Number(header?.getAttribute('sid'));
       if (payload && key && Number.isInteger(senderDeviceId) && senderDeviceId > 0) {
-        const id = message.getAttribute('id') || crypto.randomUUID();
+        const id = stableMessageId(message);
         this.emit({
           type: 'encrypted-message', id, from: bareJid(message.getAttribute('from') ?? ''),
           timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(), archived,
@@ -367,8 +386,12 @@ export class XmppClient {
     }
     const body = textOf(message, 'body');
     if (body === undefined) return undefined;
-    const id = message.getAttribute('id') || crypto.randomUUID();
-    this.emit({ type: 'message', id, from: bareJid(message.getAttribute('from') ?? ''), body, timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(), archived });
+    const id = stableMessageId(message);
+    const from = bareJid(message.getAttribute('from') ?? '');
+    const to = bareJid(message.getAttribute('to') ?? '');
+    const own = bareJid(this.credentials?.jid ?? '');
+    const direction = from === own ? 'outgoing' : 'incoming';
+    this.emit({ type: 'message', id, from: direction === 'outgoing' ? to : from, body, timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(), direction, archived });
     return id;
   }
 
@@ -446,6 +469,11 @@ function parseJid(jid: string): { local: string; domain: string } {
 
 function bareJid(jid: string): string {
   return jid.split('/')[0] ?? jid;
+}
+
+function stableMessageId(message: Element): string {
+  const origin = descendants(message, 'origin-id').find((item) => item.namespaceURI === 'urn:xmpp:sid:0');
+  return origin?.getAttribute('id') || message.getAttribute('id') || crypto.randomUUID();
 }
 
 function xmppIqError(iq: Element): string {

@@ -3,6 +3,7 @@ import { BRAND } from '../config/branding';
 import { activeProfile, createProfile, deleteProfile, duplicateProfileSettings, reorderProfiles } from '../models/profiles';
 import { conversationMatchesQuery, ensureConversation, recordIncomingActivity } from '../models/conversations';
 import { requireSourceIdentity, switchProfileState } from '../models/profileRuntime';
+import { reconcileToxFriends, resolveToxContact } from '../models/toxIdentity';
 import type { Account, Contact, Conversation, LocalProfile, Message, PluginPermission, ProfileSettings, VaultData } from '../models/types';
 import { networkPolicy, type NetworkActivity } from '../network/policy';
 import { XmppClient } from '../protocols/xmpp/client';
@@ -15,6 +16,7 @@ import { Vault } from '../security/vault';
 import { copy, type Language } from './i18n';
 import { AccountsIcon, ArrowIcon, CancelIcon, ChatIcon, ContactsIcon, DeliveredIcon, DownloadIcon, EditIcon, FailedIcon, LockIcon, PendingIcon, PluginsIcon, PlusIcon, SearchIcon, SendIcon, SentIcon, SettingsIcon, ShieldIcon, ToxIcon, UserIcon, XmppIcon } from './icons';
 import { CommandPalette } from './CommandPalette';
+import { ContextMenu, useContextMenu } from './ContextMenu';
 import { ProfileRail, type ProfileScope } from './ProfileRail';
 import { PlaintextConfirmationRequired, resolveEncryptionProvider } from '../encryption/provider';
 import { requestLocalNotifications, showLocalMessageNotification } from './notifications';
@@ -249,9 +251,10 @@ export function App() {
             profile.conversations.push(conversation);
           }
           const visible = viewState.current.activeProfileId === profileId && viewState.current.screen === 'chats' && viewState.current.conversationId === conversation.id;
-          recordIncomingActivity(conversation, visible, event.timestamp);
-          conversationTitle = conversation.title; shouldNotify = !visible;
-          profile.messages.push({ id: event.id, conversationId: conversation.id, direction: 'incoming', body: event.body, timestamp: event.timestamp, delivery: 'delivered', sourceAccountId: account.id, encryptionProvider: 'plaintext' });
+          if (event.direction === 'incoming') recordIncomingActivity(conversation, visible, event.timestamp);
+          else conversation.updatedAt = Math.max(conversation.updatedAt, event.timestamp);
+          conversationTitle = conversation.title; shouldNotify = event.direction === 'incoming' && !visible;
+          profile.messages.push({ id: event.id, conversationId: conversation.id, direction: event.direction, body: event.body, timestamp: event.timestamp, delivery: 'delivered', sourceAccountId: account.id, encryptionProvider: 'plaintext' });
         }).then(() => { refresh(); if (shouldNotify) showLocalMessageNotification(profileName, conversationTitle, event.body, vault.snapshot.settings.showNotificationPreviews); });
       }
       if (event.type === 'encrypted-message') {
@@ -301,6 +304,10 @@ export function App() {
       }
       if (event.type === 'receipt') {
         void vault.update((draft) => { const message = draft.profiles.find((profile) => profile.id === profileId)?.messages.find((item) => item.id === event.id); if (message) message.delivery = 'delivered'; }).then(refresh);
+      }
+      if (event.type === 'message-error') {
+        void vault.update((draft) => { const message = draft.profiles.find((profile) => profile.id === profileId)?.messages.find((item) => item.id === event.id); if (message) message.delivery = 'failed'; }).then(refresh);
+        setError(event.detail);
       }
     });
     xmppClients.current.set(key, client);
@@ -405,11 +412,9 @@ export function App() {
       let conversationTitle = `Tox ${event.friendNumber + 1}`;
       void vault.update((draft) => {
         const profile = draft.profiles.find((item) => item.id === profileId); if (!profile) return;
-        let contact = profile.contacts.find((item) => item.accountId === accountId && item.remoteId === String(event.friendNumber));
-        if (!contact) {
-          contact = { id: crypto.randomUUID(), accountId, protocol: 'tox', address: `friend:${event.friendNumber}`, alias: `Tox ${event.friendNumber + 1}`, presence: 'online', remoteId: String(event.friendNumber) };
-          profile.contacts.push(contact);
-        }
+        const contact = resolveToxContact(profile, accountId, event.friendNumber, event.publicKey);
+        if (!contact) return;
+        contact.presence = 'online';
         let conversation = profile.conversations.find((item) => item.contactId === contact.id);
         if (!conversation) {
           conversation = { id: crypto.randomUUID(), contactId: contact.id, protocol: 'tox', title: contact.alias, unread: 0, updatedAt: event.timestamp, sourceAccountId: accountId, encryption: { policy: 'secure-auto', provider: 'tox', verified: true, devices: [] } };
@@ -434,11 +439,7 @@ export function App() {
       }
       if (event.type === 'ready') {
         current.address = event.address; current.savedata = event.savedata;
-        for (const friend of event.friends) {
-          const existingContact = profile.contacts.find((item) => item.accountId === accountId && item.remoteId === String(friend.friendNumber));
-          if (existingContact) existingContact.address = friend.publicKey;
-          else profile.contacts.push({ id: crypto.randomUUID(), accountId, protocol: 'tox', address: friend.publicKey, alias: `Tox ${friend.publicKey.slice(0, 8)}`, presence: 'offline', remoteId: String(friend.friendNumber) });
-        }
+        reconcileToxFriends(profile, accountId, event.friends);
       }
       if (event.type === 'savedata') current.savedata = event.savedata;
       if (event.type === 'transport' && event.transport === 'tcp') {
@@ -450,11 +451,11 @@ export function App() {
         requestAdded = true;
       }
       if (event.type === 'friend-connection') {
-        const contact = profile.contacts.find((item) => item.accountId === accountId && item.remoteId === String(event.friendNumber));
+        const contact = resolveToxContact(profile, accountId, event.friendNumber, event.publicKey, false);
         if (contact) contact.presence = event.online ? 'online' : 'offline';
       }
       if (event.type === 'receipt') {
-        const message = profile.messages.find((item) => item.id === `tox:${accountId}:${event.messageId}`);
+        const message = profile.messages.find((item) => item.sourceAccountId === accountId && item.protocolMessageId === String(event.messageId) && item.protocolPeerId === event.publicKey);
         if (message) message.delivery = 'delivered';
       }
     }).then(() => {
@@ -480,7 +481,7 @@ export function App() {
         const messageId = await client.sendMessage(friendNumber, message.body);
         await vault.update((draft) => {
           const current = draft.profiles.find((item) => item.id === profileId)?.messages.find((item) => item.id === message.id);
-          if (current) { current.id = `tox:${accountId}:${messageId}`; current.delivery = 'sent'; }
+          if (current) { current.protocolMessageId = String(messageId); current.protocolPeerId = contact.address; current.delivery = 'sent'; }
         });
       } catch { break; }
     }
@@ -557,7 +558,8 @@ export function App() {
     if (source.protocol === 'xmpp') {
       const omemoAvailable = omemoEngines.current.has(`${profileId}:${sourceAccountId}`);
       try {
-        provider = resolveEncryptionProvider(conversation.encryption?.policy ?? profile.settings.defaultEncryptionPolicy, { omemo: omemoAvailable, otr: false }) as 'plaintext' | 'omemo' | 'otr';
+        const policy = conversation.encryption?.policy ?? profile.settings.defaultEncryptionPolicy;
+        provider = resolveEncryptionProvider(policy, { omemo: omemoAvailable, otr: false }, policy === 'plaintext') as 'plaintext' | 'omemo' | 'otr';
       } catch (reason) {
         if (!(reason instanceof PlaintextConfirmationRequired) || !window.confirm(languageHint(t, 'OMEMO/OTR недоступен. Отправить это сообщение через XMPP с защитой только TLS?', 'OMEMO/OTR is unavailable. Send this message over TLS-only XMPP?'))) throw reason;
         provider = 'plaintext';
@@ -581,18 +583,18 @@ export function App() {
     refresh();
     try {
       let sentId: string;
+      let toxMessageId: number | undefined;
       if (source.protocol === 'tox') {
         const friendNumber = Number(contact.remoteId);
         if (!Number.isInteger(friendNumber) || friendNumber < 0) throw new Error('Tox contact is not linked to a toxcore friend');
         const client = await connectTox(source, profileId);
-        let messageId: number;
         try {
-          messageId = await client.sendMessage(friendNumber, body);
+          toxMessageId = await client.sendMessage(friendNumber, body);
         } catch {
           setError(languageHint(t, 'Контакт временно не в сети. Сообщение отправится автоматически после восстановления связи.', 'The contact is temporarily offline. The message will be sent automatically when the connection returns.'));
           return;
         }
-        sentId = `tox:${sourceAccountId}:${messageId}`;
+        sentId = pendingId;
       } else {
         const client = xmppClients.current.get(`${profileId}:${sourceAccountId}`);
         if (!client) throw new Error(languageHint(t, 'Сначала подключите XMPP-аккаунт.', 'Connect the XMPP account first.'));
@@ -621,7 +623,14 @@ export function App() {
       }
       await vault.update((draft) => {
         const message = draft.profiles.find((item) => item.id === profileId)?.messages.find((item) => item.id === pendingId);
-        if (message) { message.id = sentId; message.delivery = 'sent'; }
+        if (message) {
+          message.id = sentId;
+          message.delivery = 'sent';
+          if (source.protocol === 'tox') {
+            message.protocolMessageId = String(toxMessageId!);
+            message.protocolPeerId = contact.address;
+          }
+        }
       });
       refresh();
     } catch (reason) {
@@ -708,6 +717,80 @@ export function App() {
     await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === profileId); if (profile) profile.drafts[conversationId] = body; }); refresh();
   };
 
+  const setConversationEncryptionPolicy = async (profileId: string, conversationId: string, policy: 'secure-auto' | 'force-omemo' | 'plaintext') => {
+    await vault.update((draft) => {
+      const conversation = draft.profiles.find((item) => item.id === profileId)?.conversations.find((item) => item.id === conversationId);
+      if (!conversation || conversation.protocol !== 'xmpp') return;
+      const previous = conversation.encryption;
+      conversation.encryption = {
+        policy,
+        provider: policy === 'plaintext' ? 'plaintext' : previous?.provider === 'omemo' ? 'omemo' : 'plaintext',
+        verified: policy !== 'plaintext' && Boolean(previous?.verified),
+        devices: previous?.devices ?? [],
+        warning: policy === 'plaintext' ? 'tls-only' : previous?.verified ? undefined : 'first-use',
+      };
+    });
+    refresh();
+  };
+
+  const deleteConversation = async (profileId: string, conversationId: string) => {
+    await vault.update((draft) => {
+      const profile = draft.profiles.find((item) => item.id === profileId); if (!profile) return;
+      profile.messages = profile.messages.filter((item) => item.conversationId !== conversationId);
+      profile.conversations = profile.conversations.filter((item) => item.id !== conversationId);
+      delete profile.drafts[conversationId];
+      delete profile.ui.lastChannelByConversation[conversationId];
+      if (profile.ui.lastConversationId === conversationId) profile.ui.lastConversationId = undefined;
+    });
+    if (data.activeProfileId === profileId && selectedConversation === conversationId) setSelectedConversation(undefined);
+    refresh();
+  };
+
+  const deleteContact = async (contactId: string) => {
+    const profileId = data.activeProfileId;
+    const snapshot = vault.snapshot.profiles.find((item) => item.id === profileId);
+    const contact = snapshot?.contacts.find((item) => item.id === contactId);
+    const account = snapshot?.accounts.find((item) => item.id === contact?.accountId);
+    if (!snapshot || !contact || !account) return;
+    try {
+      if (contact.protocol === 'tox' && contact.remoteId !== undefined) {
+        const client = toxClients.current.get(`${profileId}:${account.id}`);
+        if (client) await client.removeFriend(Number(contact.remoteId));
+      } else if (contact.protocol === 'xmpp') {
+        xmppClients.current.get(`${profileId}:${account.id}`)?.removeContact(contact.address);
+      }
+    } catch (reason) { setError(redactError(reason)); }
+    await vault.update((draft) => {
+      const profile = draft.profiles.find((item) => item.id === profileId); if (!profile) return;
+      const conversationIds = new Set(profile.conversations.filter((item) => item.contactId === contactId).map((item) => item.id));
+      profile.contacts = profile.contacts.filter((item) => item.id !== contactId);
+      profile.conversations = profile.conversations.filter((item) => !conversationIds.has(item.id));
+      profile.messages = profile.messages.filter((item) => !conversationIds.has(item.conversationId));
+      for (const id of conversationIds) { delete profile.drafts[id]; delete profile.ui.lastChannelByConversation[id]; }
+      if (profile.ui.lastConversationId && conversationIds.has(profile.ui.lastConversationId)) profile.ui.lastConversationId = undefined;
+    });
+    setSelectedConversation(undefined);
+    refresh();
+  };
+
+  const renameProfileFromMenu = async (profile: LocalProfile) => {
+    const next = window.prompt(languageHint(t, 'Новое имя профиля', 'New profile name'), profile.name)?.trim();
+    if (!next) return;
+    await vault.update((draft) => { const target = draft.profiles.find((item) => item.id === profile.id); if (target) { target.name = next.slice(0, 128); target.initials = next.slice(0, 2).toUpperCase(); } });
+    refresh();
+  };
+
+  const deleteProfileFromMenu = async (profile: LocalProfile) => {
+    if (data.profiles.length === 1 || !window.confirm(languageHint(t, `Удалить профиль «${profile.name}» и все его локальные данные?`, `Delete profile “${profile.name}” and all its local data?`))) return;
+    for (const account of profile.accounts) {
+      const key = `${profile.id}:${account.id}`;
+      xmppClients.current.get(key)?.stop(); xmppClients.current.delete(key); omemoEngines.current.delete(key); omemoInitializations.current.delete(key);
+      await toxClients.current.get(key)?.stop().catch(() => undefined); toxClients.current.delete(key);
+    }
+    await vault.update((draft) => deleteProfile(draft, profile.id));
+    setSelectedConversation(undefined); setProfileScope('all'); refresh();
+  };
+
   const setConversationDeviceTrust = async (profileId: string, conversationId: string, deviceId: string, trusted: boolean) => {
     await vault.update((draft) => {
       const conversation = draft.profiles.find((item) => item.id === profileId)?.conversations.find((item) => item.id === conversationId);
@@ -757,15 +840,15 @@ export function App() {
     <div className="app-shell">
       <div className="app-grid">
         <aside className="app-sidebar">
-          <ProfileRail data={data} scope={profileScope} onAll={() => { setProfileScope('all'); setScreen('chats'); setSelectedConversation(undefined); }} onSelect={(id) => void selectProfile(id)} onCreate={() => void createNewProfile()} onReorder={(draggedId, targetId) => void vault.update((draft) => reorderProfiles(draft, draggedId, targetId)).then(refresh)} onPalette={() => setPaletteOpen(true)}/>
+          <ProfileRail data={data} scope={profileScope} onAll={() => { setProfileScope('all'); setScreen('chats'); setSelectedConversation(undefined); }} onSelect={(id) => void selectProfile(id)} onCreate={() => void createNewProfile()} onReorder={(draggedId, targetId) => void vault.update((draft) => reorderProfiles(draft, draggedId, targetId)).then(refresh)} onPalette={() => setPaletteOpen(true)} onRename={(profile) => void renameProfileFromMenu(profile)} onDelete={(profile) => void deleteProfileFromMenu(profile)} onExport={(profile) => void vault.exportProfile(profile.id).then((payload) => downloadText(payload, `${safeFilename(profile.name)}.rlprofile`)).catch((reason) => setError(redactError(reason)))}/>
           <Nav screen={screen} setScreen={setScreen} pendingContacts={data.profiles.reduce((count, profile) => count + profile.friendRequests.length, 0)} t={t}/>
           <button className="sidebar-lock" onClick={lock} aria-label={t.lock} title={t.lock}><LockIcon/></button>
         </aside>
         <main className="workspace">
           <WorkspaceErrorBoundary resetKey={`${screen}:${currentProfile.id}`} language={language}>
-          {screen === 'chats' && <Messenger data={data} scope={profileScope} selected={selectedConversation} onBack={() => setSelectedConversation(undefined)} selectConversation={selectConversation} setScreen={setScreen} sendMessage={sendMessage} setSource={setConversationSource} saveDraft={saveDraft} setDeviceTrust={setConversationDeviceTrust} t={t}/>}
+          {screen === 'chats' && <Messenger data={data} scope={profileScope} selected={selectedConversation} onBack={() => setSelectedConversation(undefined)} selectConversation={selectConversation} setScreen={setScreen} sendMessage={sendMessage} setSource={setConversationSource} saveDraft={saveDraft} setDeviceTrust={setConversationDeviceTrust} setEncryptionPolicy={setConversationEncryptionPolicy} deleteConversation={deleteConversation} t={t}/>}
           {screen === 'accounts' && <Accounts profile={currentProfile} addXmpp={addXmpp} connectXmpp={(account) => connectXmpp(account, currentProfile.id)} addTox={addTox} connectTox={(account) => connectTox(account, currentProfile.id)} disconnectAccount={disconnectAccount} removeAccount={removeAccount} exportAccount={async (account) => { try { let exportPassword: string | undefined; if (!vault.isPersistent) { exportPassword = window.prompt(languageHint(t, 'Придумайте пароль для зашифрованной копии (минимум 10 символов)', 'Create a password for the encrypted backup (at least 10 characters)'))?.trim(); if (!exportPassword) return; } downloadText(await vault.exportAccount(currentProfile.id, account.id, exportPassword), `${safeFilename(account.alias)}.rlaccount`); } catch (reason) { setError(redactError(reason)); } }} t={t}/>}
-          {screen === 'contacts' && <Contacts profile={currentProfile} acceptToxFriend={acceptToxFriend} rejectToxFriend={rejectToxFriend} addXmppContact={addXmppContact} addToxFriend={addToxFriend} openContact={openContact} renameContact={renameContact} goToAccounts={() => setScreen('accounts')} t={t}/>}
+          {screen === 'contacts' && <Contacts profile={currentProfile} acceptToxFriend={acceptToxFriend} rejectToxFriend={rejectToxFriend} addXmppContact={addXmppContact} addToxFriend={addToxFriend} openContact={openContact} renameContact={renameContact} deleteContact={deleteContact} goToAccounts={() => setScreen('accounts')} t={t}/>}
           {screen === 'privacy' && <Privacy data={data} profile={currentProfile} network={network} t={t} onLock={() => void lock()} onWipe={async () => { await vault.wipe(); setData(undefined); setGate('launch'); }} onExport={async () => downloadText(await vault.exportEncrypted(), 'relayless-vault.rlvault')}/>}
           {screen === 'plugins' && <Plugins data={data} t={t} onInstall={async (source, granted) => { const manifest = parsePluginManifest(source); await vault.update((draft) => { draft.plugins = installPlugin(manifest, granted, draft.plugins); }); refresh(); }} onToggle={async (id) => { await vault.update((draft) => { const plugin = draft.plugins.find((item) => item.manifest.id === id); if (plugin) plugin.enabled = !plugin.enabled; }); refresh(); }} onRemove={async (id) => { await vault.update((draft) => { draft.plugins = draft.plugins.filter((item) => item.manifest.id !== id); }); refresh(); }}/>}
           {screen === 'settings' && <Settings data={data} profile={currentProfile} t={t} onSave={updateSettings} onProfileUpdate={async (settings) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.settings = settings; }); refresh(); }} onRename={async (name) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) { profile.name = name; profile.initials = name.slice(0, 2).toUpperCase(); } }); refresh(); }} onPin={async () => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.pinned = !profile.pinned; }); refresh(); }} onAvatar={async (avatar) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.avatar = avatar; }); refresh(); }} onLockProfile={async () => { for (const account of currentProfile.accounts) { const key = `${currentProfile.id}:${account.id}`; xmppClients.current.get(key)?.stop(); xmppClients.current.delete(key); omemoEngines.current.delete(key); void toxClients.current.get(key)?.stop(); toxClients.current.delete(key); } await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) { profile.locked = true; profile.runtimeState = 'locked'; } }); refresh(); setProfileScope('all'); setSelectedConversation(undefined); setScreen('chats'); }} onDuplicate={async () => { await vault.update((draft) => duplicateProfileSettings(draft, currentProfile.id, `${currentProfile.name} copy`)); refresh(); }} onEphemeral={() => void createNewProfile(true)} onDelete={async () => { for (const account of currentProfile.accounts) { const key = `${currentProfile.id}:${account.id}`; xmppClients.current.get(key)?.stop(); omemoEngines.current.delete(key); void toxClients.current.get(key)?.stop(); } await vault.update((draft) => deleteProfile(draft, currentProfile.id)); refresh(); }} onExportProfile={async () => downloadText(await vault.exportProfile(currentProfile.id), `${safeFilename(currentProfile.name)}.rlprofile`)} onImportProfile={async (text) => { const id = await vault.importProfile(text); refresh(); await selectProfile(id); }}/>}
@@ -815,8 +898,9 @@ function Unlock({ language, setLanguage, error, unlock }: { language: Language; 
   return <div className="unlock-page"><main className="unlock-box"><div className="language-switch"><button className={language === 'ru' ? 'active' : ''} onClick={() => setLanguage('ru')}>RU</button><button className={language === 'en' ? 'active' : ''} onClick={() => setLanguage('en')}>EN</button></div><div className="unlock-avatar"><LockIcon/></div><h1>{isRu ? 'Введите пароль' : 'Enter password'}</h1><p>{isRu ? 'Чтобы открыть ваши чаты' : 'To open your chats'}</p><form onSubmit={(event) => { event.preventDefault(); void unlock(password, rememberDevice); }}><input autoFocus type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="••••••••••••"/><label className="device-unlock-check"><input type="checkbox" checked={rememberDevice} onChange={(event) => setRememberDevice(event.target.checked)}/><span><strong>{isRu ? 'Запомнить на этом устройстве' : 'Remember on this device'}</strong><small>{isRu ? 'Не спрашивать пароль после обновления страницы' : 'Do not ask after refreshing the page'}</small></span></label><button className="primary" type="submit">{isRu ? 'Открыть' : 'Open'}</button></form>{error && <div className="inline-error">{error}</div>}</main></div>;
 }
 
-function Messenger({ data, scope, selected, onBack, selectConversation, setScreen, sendMessage, setSource, saveDraft, setDeviceTrust, t }: { data: VaultData; scope: ProfileScope; selected?: string; onBack: () => void; selectConversation: (profileId: string, conversationId: string) => Promise<void>; setScreen: (screen: Screen) => void; sendMessage: (profileId: string, conversation: Conversation, body: string, sourceAccountId: string) => Promise<void>; setSource: (profileId: string, conversationId: string, accountId: string) => Promise<void>; saveDraft: (profileId: string, conversationId: string, body: string) => Promise<void>; setDeviceTrust: (profileId: string, conversationId: string, deviceId: string, trusted: boolean) => Promise<void>; t: typeof copy[Language] }) {
+function Messenger({ data, scope, selected, onBack, selectConversation, setScreen, sendMessage, setSource, saveDraft, setDeviceTrust, setEncryptionPolicy, deleteConversation, t }: { data: VaultData; scope: ProfileScope; selected?: string; onBack: () => void; selectConversation: (profileId: string, conversationId: string) => Promise<void>; setScreen: (screen: Screen) => void; sendMessage: (profileId: string, conversation: Conversation, body: string, sourceAccountId: string) => Promise<void>; setSource: (profileId: string, conversationId: string, accountId: string) => Promise<void>; saveDraft: (profileId: string, conversationId: string, body: string) => Promise<void>; setDeviceTrust: (profileId: string, conversationId: string, deviceId: string, trusted: boolean) => Promise<void>; setEncryptionPolicy: (profileId: string, conversationId: string, policy: 'secure-auto' | 'force-omemo' | 'plaintext') => Promise<void>; deleteConversation: (profileId: string, conversationId: string) => Promise<void>; t: typeof copy[Language] }) {
   const [query, setQuery] = useState('');
+  const context = useContextMenu<{ profile: LocalProfile; conversation: Conversation }>();
   const profile = activeProfile(data);
   const rows = useMemo(() => {
     const profiles = scope === 'all' ? data.profiles.filter((item) => !item.locked) : data.profiles.filter((item) => item.id === scope && !item.locked);
@@ -829,11 +913,16 @@ function Messenger({ data, scope, selected, onBack, selectConversation, setScree
   const newChatLabel = hasContacts ? languageHint(t, 'Новый чат', 'New chat') : t.connectAccount;
   return <div className="messenger-grid"><section className="conversation-panel"><div className="section-head"><h2>{t.chats}</h2><button className="round-action" onClick={() => setScreen(newChatScreen)} title={newChatLabel} aria-label={newChatLabel}><PlusIcon/></button></div><label className="search"><SearchIcon/><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={languageHint(t, 'Поиск по чатам и сообщениям', 'Search chats and messages')}/></label><div className="conversation-list">{rows.map(({ profile: owner, conversation }) => {
     const contact = owner.contacts.find((item) => item.id === conversation.contactId);
-    return <button key={`${owner.id}:${conversation.id}`} className={owner.id === profile.id && conversation.id === selected ? 'selected' : ''} onClick={() => void selectConversation(owner.id, conversation.id)}><span className="chat-avatar conversation-avatar">{conversation.title.slice(0, 2).toUpperCase()}<span className={`protocol-mini ${contact?.presence ?? 'offline'}`}>{conversation.protocol === 'tox' ? <ToxIcon/> : <XmppIcon/>}</span></span><span className="conversation-copy"><strong>{conversation.title}</strong><small>{scope === 'all' ? `${owner.name}: ` : ''}{lastMessage(owner.messages, conversation.id)?.body ?? languageHint(t, 'Новый диалог', 'New conversation')}</small></span><span className="conversation-meta"><time>{formatTime(conversation.updatedAt)}</time>{conversation.unread > 0 && <b>{conversation.unread}</b>}</span></button>;
-  })}{rows.length === 0 && <EmptyState title={query ? languageHint(t, 'Ничего не найдено', 'Nothing found') : t.noConversations} text={query ? languageHint(t, 'Попробуйте другой запрос.', 'Try another search.') : hasContacts ? languageHint(t, 'Выберите контакт и начните диалог.', 'Choose a contact and start a conversation.') : languageHint(t, 'Подключите аккаунт, чтобы начать общение.', 'Connect an account to start chatting.')} >{!query && <button className="primary compact-action" onClick={() => setScreen(newChatScreen)}>{newChatLabel}</button>}</EmptyState>}</div></section><section className="chat-panel">{current ? <ActiveChat profile={profile} conversation={current} messages={messages} onBack={onBack} send={sendMessage} setSource={setSource} saveDraft={saveDraft} setDeviceTrust={setDeviceTrust} t={t}/> : <div className="chat-idle"><div className="idle-bubble"><ChatIcon/></div><strong>{languageHint(t, 'Выберите чат', 'Choose a chat')}</strong><p>{languageHint(t, 'Здесь появятся сообщения.', 'Messages will appear here.')}</p></div>}</section></div>;
+    return <button key={`${owner.id}:${conversation.id}`} className={owner.id === profile.id && conversation.id === selected ? 'selected' : ''} onClick={() => void selectConversation(owner.id, conversation.id)} onContextMenu={(event) => context.open(event, { profile: owner, conversation })} title={languageHint(t, 'ПКМ — действия с чатом', 'Right-click for chat actions')}><span className="chat-avatar conversation-avatar">{conversation.title.slice(0, 2).toUpperCase()}<span className={`protocol-mini ${contact?.presence ?? 'offline'}`}>{conversation.protocol === 'tox' ? <ToxIcon/> : <XmppIcon/>}</span></span><span className="conversation-copy"><strong>{conversation.title}</strong><small>{scope === 'all' ? `${owner.name}: ` : ''}{lastMessage(owner.messages, conversation.id)?.body ?? languageHint(t, 'Новый диалог', 'New conversation')}</small></span><span className="conversation-meta"><time>{formatTime(conversation.updatedAt)}</time>{conversation.unread > 0 && <b>{conversation.unread}</b>}</span></button>;
+  })}{rows.length === 0 && <EmptyState title={query ? languageHint(t, 'Ничего не найдено', 'Nothing found') : t.noConversations} text={query ? languageHint(t, 'Попробуйте другой запрос.', 'Try another search.') : hasContacts ? languageHint(t, 'Выберите контакт и начните диалог.', 'Choose a contact and start a conversation.') : languageHint(t, 'Подключите аккаунт, чтобы начать общение.', 'Connect an account to start chatting.')} >{!query && <button className="primary compact-action" onClick={() => setScreen(newChatScreen)}>{newChatLabel}</button>}</EmptyState>}</div></section><section className="chat-panel">{current ? <ActiveChat profile={profile} conversation={current} messages={messages} onBack={onBack} send={sendMessage} setSource={setSource} saveDraft={saveDraft} setDeviceTrust={setDeviceTrust} setEncryptionPolicy={setEncryptionPolicy} t={t}/> : <div className="chat-idle"><div className="idle-bubble"><ChatIcon/></div><strong>{languageHint(t, 'Выберите чат', 'Choose a chat')}</strong><p>{languageHint(t, 'Здесь появятся сообщения.', 'Messages will appear here.')}</p></div>}</section>{context.menu && (() => { const owner = context.menu.value.profile; const conversation = context.menu.value.conversation; const contact = owner.contacts.find((item) => item.id === conversation.contactId); const latest = lastMessage(owner.messages, conversation.id); return <ContextMenu state={context.menu} onClose={context.close} items={[
+    { label: languageHint(t, 'Открыть чат', 'Open chat'), action: () => selectConversation(owner.id, conversation.id) },
+    { label: languageHint(t, 'Копировать адрес', 'Copy address'), disabled: !contact?.address, action: () => navigator.clipboard.writeText(contact?.address ?? '') },
+    { label: languageHint(t, 'Копировать последнее сообщение', 'Copy last message'), disabled: !latest, action: () => navigator.clipboard.writeText(latest?.body ?? '') },
+    { label: languageHint(t, 'Удалить чат', 'Delete chat'), danger: true, action: () => { if (window.confirm(languageHint(t, `Удалить чат «${conversation.title}» и его локальную историю?`, `Delete “${conversation.title}” and its local history?`))) return deleteConversation(owner.id, conversation.id); } },
+  ]}/>; })()}</div>;
 }
 
-function ActiveChat({ profile, conversation, messages, onBack, send, setSource, saveDraft, setDeviceTrust, t }: { profile: LocalProfile; conversation: Conversation; messages: Message[]; onBack: () => void; send: (profileId: string, conversation: Conversation, body: string, sourceAccountId: string) => Promise<void>; setSource: (profileId: string, conversationId: string, accountId: string) => Promise<void>; saveDraft: (profileId: string, conversationId: string, body: string) => Promise<void>; setDeviceTrust: (profileId: string, conversationId: string, deviceId: string, trusted: boolean) => Promise<void>; t: typeof copy[Language] }) {
+function ActiveChat({ profile, conversation, messages, onBack, send, setSource, saveDraft, setDeviceTrust, setEncryptionPolicy, t }: { profile: LocalProfile; conversation: Conversation; messages: Message[]; onBack: () => void; send: (profileId: string, conversation: Conversation, body: string, sourceAccountId: string) => Promise<void>; setSource: (profileId: string, conversationId: string, accountId: string) => Promise<void>; saveDraft: (profileId: string, conversationId: string, body: string) => Promise<void>; setDeviceTrust: (profileId: string, conversationId: string, deviceId: string, trusted: boolean) => Promise<void>; setEncryptionPolicy: (profileId: string, conversationId: string, policy: 'secure-auto' | 'force-omemo' | 'plaintext') => Promise<void>; t: typeof copy[Language] }) {
   const [body, setBody] = useState(profile.drafts[conversation.id] ?? '');
   const [securityOpen, setSecurityOpen] = useState(false);
   const [visibleCount, setVisibleCount] = useState(MESSAGE_RENDER_BATCH);
@@ -847,13 +936,15 @@ function ActiveChat({ profile, conversation, messages, onBack, send, setSource, 
   const contact = profile.contacts.find((item) => item.id === conversation.contactId);
   const security = encryptionLabel(conversation, t);
   const securityBadge = <>{conversation.protocol === 'tox' ? <ToxIcon/> : <XmppIcon/>}{security.label}</>;
-  return <><div className="chat-head"><button className="back-button" onClick={onBack} aria-label={languageHint(t, 'Назад', 'Back')}><ArrowIcon/></button><span className="chat-avatar">{conversation.title.slice(0, 2).toUpperCase()}</span><div className="chat-head-copy"><h2>{conversation.title}</h2><small>{presenceLabel(contact?.presence ?? 'offline', t)}</small></div>{conversation.encryption?.provider === 'omemo' ? <button className={`security-state ${security.tone}`} onClick={() => setSecurityOpen((open) => !open)} aria-expanded={securityOpen}>{securityBadge}</button> : <span className={`security-state ${security.tone}`}>{securityBadge}</span>}</div>{securityOpen && conversation.encryption?.provider === 'omemo' && <section className="security-sheet" role="dialog" aria-label={languageHint(t, 'Проверка шифрования', 'Encryption verification')}><div className="security-sheet-head"><div><strong>{languageHint(t, 'Проверка устройств', 'Verify devices')}</strong><small>{languageHint(t, 'Сверьте отпечаток другим надёжным способом.', 'Compare each fingerprint over another trusted channel.')}</small></div><button onClick={() => setSecurityOpen(false)} aria-label={languageHint(t, 'Закрыть', 'Close')}>×</button></div>{conversation.encryption.devices.length === 0 ? <p>{languageHint(t, 'Устройства контакта ещё не получены.', 'No contact devices have been received yet.')}</p> : conversation.encryption.devices.map((device) => <article className={device.changedAt ? 'changed' : ''} key={device.id}><div><strong>{device.label}</strong>{device.changedAt && <em>{languageHint(t, 'Ключ изменился', 'Key changed')}</em>}<code>{device.fingerprint || languageHint(t, 'Отпечаток недоступен', 'Fingerprint unavailable')}</code></div><button className={device.trust === 'trusted' ? 'trusted' : ''} disabled={!device.fingerprint} onClick={() => void setDeviceTrust(profile.id, conversation.id, device.id, device.trust !== 'trusted')}>{device.trust === 'trusted' ? languageHint(t, 'Проверено', 'Verified') : languageHint(t, 'Доверять', 'Trust')}</button></article>)}</section>}<div className="messages">{messages.length === 0 && <div className="conversation-start"><strong>{conversation.title}</strong><span>{security.label}</span><p>{languageHint(t, 'Напишите первое сообщение.', 'Write the first message.')}</p></div>}{hiddenMessageCount > 0 && <button className="load-older" onClick={() => setVisibleCount((count) => count + MESSAGE_RENDER_BATCH)}>{languageHint(t, `Показать ещё ${Math.min(hiddenMessageCount, MESSAGE_RENDER_BATCH)}`, `Show ${Math.min(hiddenMessageCount, MESSAGE_RENDER_BATCH)} more`)}</button>}{visibleMessages.map((message) => <article key={message.id} className={`${message.direction} ${message.delivery === 'failed' ? 'failed' : ''}`}><p>{message.body}<span className="message-meta"><time>{formatTime(message.timestamp)}</time>{message.direction === 'outgoing' && <MessageDelivery state={message.delivery} t={t}/>}</span></p></article>)}<div className="message-anchor" ref={messagesEnd}/></div><form className="composer" onSubmit={(event) => { event.preventDefault(); const value = body.trim(); if (!value || !sourceId) return; setBody(''); void send(profile.id, conversation, value, sourceId).catch(() => setBody(value)); }}>{identities.length > 1 && <select className="identity-selector" aria-label={languageHint(t, 'Отправить от имени', 'Send as')} value={sourceId} onChange={(event) => void setSource(profile.id, conversation.id, event.target.value)} required><option value="" disabled>{languageHint(t, 'Выберите аккаунт', 'Choose account')}</option>{identities.map((identity) => <option key={identity.id} value={identity.id}>{identity.alias}</option>)}</select>}<textarea rows={1} value={body} onChange={(event) => setBody(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} onBlur={() => void saveDraft(profile.id, conversation.id, body)} placeholder={sourceId ? languageHint(t, 'Сообщение', 'Message') : languageHint(t, 'Сначала выберите аккаунт', 'Choose an account first')} maxLength={conversation.protocol === 'tox' ? TOX_MESSAGE_MAX_BYTES : XMPP_MESSAGE_MAX_BYTES}/><button type="submit" title={t.send} aria-label={t.send} disabled={!sourceId || !body.trim()}><SendIcon/></button></form></>;
+  const encryptionPolicy = conversation.encryption?.policy ?? 'secure-auto';
+  return <><div className="chat-head"><button className="back-button" onClick={onBack} aria-label={languageHint(t, 'Назад', 'Back')}><ArrowIcon/></button><span className="chat-avatar">{conversation.title.slice(0, 2).toUpperCase()}</span><div className="chat-head-copy"><h2>{conversation.title}</h2><small>{presenceLabel(contact?.presence ?? 'offline', t)}</small></div>{conversation.protocol === 'xmpp' ? <button className={`security-state ${security.tone}`} onClick={() => setSecurityOpen((open) => !open)} aria-expanded={securityOpen}>{securityBadge}</button> : <span className={`security-state ${security.tone}`}>{securityBadge}</span>}</div>{securityOpen && conversation.protocol === 'xmpp' && <section className="security-sheet" role="dialog" aria-label={languageHint(t, 'Настройки шифрования', 'Encryption settings')}><div className="security-sheet-head"><div><strong>{languageHint(t, 'Шифрование чата', 'Chat encryption')}</strong><small>{languageHint(t, 'OMEMO скрывает текст от сервера. TLS подходит клиентам без OMEMO.', 'OMEMO hides text from the server. TLS works with clients that do not support OMEMO.')}</small></div><button onClick={() => setSecurityOpen(false)} aria-label={languageHint(t, 'Закрыть', 'Close')}>×</button></div><div className="encryption-modes"><button className={encryptionPolicy === 'secure-auto' ? 'active' : ''} onClick={() => void setEncryptionPolicy(profile.id, conversation.id, 'secure-auto')}>{languageHint(t, 'Авто', 'Auto')}</button><button className={encryptionPolicy === 'force-omemo' ? 'active' : ''} onClick={() => void setEncryptionPolicy(profile.id, conversation.id, 'force-omemo')}>OMEMO</button><button className={encryptionPolicy === 'plaintext' ? 'active warning' : ''} onClick={() => void setEncryptionPolicy(profile.id, conversation.id, 'plaintext')}>TLS</button></div>{encryptionPolicy === 'plaintext' ? <p className="encryption-warning">{languageHint(t, 'Текст сможет прочитать XMPP-сервер. Выберите этот режим только для контактов без OMEMO.', 'The XMPP server can read message text. Use this only for contacts without OMEMO.')}</p> : <>{conversation.encryption?.devices.length === 0 ? <p>{languageHint(t, 'Устройства OMEMO появятся после первой защищённой отправки.', 'OMEMO devices will appear after the first encrypted send.')}</p> : conversation.encryption?.devices.map((device) => <article className={device.changedAt ? 'changed' : ''} key={device.id}><div><strong>{device.label}</strong>{device.changedAt && <em>{languageHint(t, 'Ключ изменился', 'Key changed')}</em>}<code>{device.fingerprint || languageHint(t, 'Отпечаток недоступен', 'Fingerprint unavailable')}</code></div><button className={device.trust === 'trusted' ? 'trusted' : ''} disabled={!device.fingerprint} onClick={() => void setDeviceTrust(profile.id, conversation.id, device.id, device.trust !== 'trusted')}>{device.trust === 'trusted' ? languageHint(t, 'Проверено', 'Verified') : languageHint(t, 'Доверять', 'Trust')}</button></article>)}</>}</section>}<div className="messages">{messages.length === 0 && <div className="conversation-start"><strong>{conversation.title}</strong><span>{security.label}</span><p>{languageHint(t, 'Напишите первое сообщение.', 'Write the first message.')}</p></div>}{hiddenMessageCount > 0 && <button className="load-older" onClick={() => setVisibleCount((count) => count + MESSAGE_RENDER_BATCH)}>{languageHint(t, `Показать ещё ${Math.min(hiddenMessageCount, MESSAGE_RENDER_BATCH)}`, `Show ${Math.min(hiddenMessageCount, MESSAGE_RENDER_BATCH)} more`)}</button>}{visibleMessages.map((message) => <article key={message.id} className={`${message.direction} ${message.delivery === 'failed' ? 'failed' : ''}`}><p>{message.body}<span className="message-meta"><time>{formatTime(message.timestamp)}</time>{message.direction === 'outgoing' && <MessageDelivery state={message.delivery} t={t}/>}</span></p></article>)}<div className="message-anchor" ref={messagesEnd}/></div><form className="composer" onSubmit={(event) => { event.preventDefault(); const value = body.trim(); if (!value || !sourceId) return; setBody(''); void send(profile.id, conversation, value, sourceId).catch(() => setBody(value)); }}>{identities.length > 1 && <select className="identity-selector" aria-label={languageHint(t, 'Отправить от имени', 'Send as')} value={sourceId} onChange={(event) => void setSource(profile.id, conversation.id, event.target.value)} required><option value="" disabled>{languageHint(t, 'Выберите аккаунт', 'Choose account')}</option>{identities.map((identity) => <option key={identity.id} value={identity.id}>{identity.alias}</option>)}</select>}<textarea rows={1} value={body} onChange={(event) => setBody(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} onBlur={() => void saveDraft(profile.id, conversation.id, body)} placeholder={sourceId ? languageHint(t, 'Сообщение', 'Message') : languageHint(t, 'Сначала выберите аккаунт', 'Choose an account first')} maxLength={conversation.protocol === 'tox' ? TOX_MESSAGE_MAX_BYTES : XMPP_MESSAGE_MAX_BYTES}/><button type="submit" title={t.send} aria-label={t.send} disabled={!sourceId || !body.trim()}><SendIcon/></button></form></>;
 }
 
 function Accounts({ profile, addXmpp, connectXmpp, addTox, connectTox, disconnectAccount, removeAccount, exportAccount, t }: { profile: LocalProfile; addXmpp: (account: Account) => Promise<void>; connectXmpp: (account: Account) => void; addTox: (alias: string, savedata?: string) => Promise<void>; connectTox: (account: Account) => Promise<ToxClient>; disconnectAccount: (account: Account) => Promise<void>; removeAccount: (account: Account) => Promise<void>; exportAccount: (account: Account) => Promise<void>; t: typeof copy[Language] }) {
   const [kind, setKind] = useState<'xmpp' | 'tox'>('xmpp');
   const [toxAlias, setToxAlias] = useState('Tox');
   const [toxImport, setToxImport] = useState('');
+  const context = useContextMenu<Account>();
   const toxAvailable = hasToxTransport();
   return (
     <div className="content-grid">
@@ -861,7 +952,7 @@ function Accounts({ profile, addXmpp, connectXmpp, addTox, connectTox, disconnec
         <PageTitle index="02" title={t.accounts} subtitle={profile.name}/>
         <div className={`account-list ${profile.accounts.length === 0 ? 'is-empty' : ''}`}>
           {profile.accounts.map((account) => (
-            <div className="account-row" key={account.id}>
+            <div className="account-row" key={account.id} onContextMenu={(event) => context.open(event, account)} title={languageHint(t, 'ПКМ — действия с аккаунтом', 'Right-click for account actions')}>
               <span className={`chat-avatar protocol-account ${account.protocol}`}>{account.protocol === 'xmpp' ? <XmppIcon/> : <ToxIcon/>}</span>
               <div><strong>{account.alias}</strong><small>{account.address}</small>{account.protocol === 'tox' && toxAvailable && <small className="connection-note">{languageHint(t, 'Защищённое подключение через Tox TCP.', 'Secure connection through Tox TCP.')}</small>}</div>
               <span className={`state ${account.protocol === 'tox' && !toxAvailable ? 'error' : account.connectionState ?? account.presence}`} title={account.connectionDetail}>{accountConnectionLabel(account, t)}</span>
@@ -875,6 +966,12 @@ function Accounts({ profile, addXmpp, connectXmpp, addTox, connectTox, disconnec
           ))}
           {profile.accounts.length === 0 && <EmptyState title={languageHint(t, 'Аккаунтов пока нет', 'No accounts yet')} text={languageHint(t, 'Выберите XMPP или Tox, чтобы начать.', 'Choose XMPP or Tox to get started.')}/>}
         </div>
+        {context.menu && (() => { const account = context.menu.value; const running = accountConnectionRunning(account); return <ContextMenu state={context.menu} onClose={context.close} items={[
+          { label: languageHint(t, 'Копировать адрес', 'Copy address'), disabled: !account.address, action: () => navigator.clipboard.writeText(account.address) },
+          { label: languageHint(t, 'Экспорт аккаунта', 'Export account'), action: () => exportAccount(account) },
+          { label: running ? languageHint(t, 'Отключить', 'Disconnect') : languageHint(t, 'Подключить', 'Connect'), action: () => running ? disconnectAccount(account) : account.protocol === 'xmpp' ? connectXmpp(account) : connectTox(account).then(() => undefined) },
+          { label: languageHint(t, 'Удалить аккаунт', 'Delete account'), danger: true, action: () => { if (window.confirm(languageHint(t, `Удалить «${account.alias}»?`, `Remove “${account.alias}”?`))) return removeAccount(account); } },
+        ]}/>; })()}
       </section>
       <section className="form-panel">
         <h2>{kind === 'xmpp' ? languageHint(t, 'Подключить XMPP', 'Connect XMPP') : languageHint(t, 'Создать Tox-профиль', 'Create Tox profile')}</h2>
@@ -894,7 +991,7 @@ function Accounts({ profile, addXmpp, connectXmpp, addTox, connectTox, disconnec
   );
 }
 
-function Contacts({ profile, acceptToxFriend, rejectToxFriend, addXmppContact, addToxFriend, openContact, renameContact, goToAccounts, t }: { profile: LocalProfile; acceptToxFriend: (requestId: string) => Promise<void>; rejectToxFriend: (requestId: string) => Promise<void>; addXmppContact: (accountId: string, address: string, alias: string) => Promise<string>; addToxFriend: (accountId: string, address: string, message: string) => Promise<string>; openContact: (contactId: string) => Promise<void>; renameContact: (contactId: string, name: string) => Promise<void>; goToAccounts: () => void; t: typeof copy[Language] }) {
+function Contacts({ profile, acceptToxFriend, rejectToxFriend, addXmppContact, addToxFriend, openContact, renameContact, deleteContact, goToAccounts, t }: { profile: LocalProfile; acceptToxFriend: (requestId: string) => Promise<void>; rejectToxFriend: (requestId: string) => Promise<void>; addXmppContact: (accountId: string, address: string, alias: string) => Promise<string>; addToxFriend: (accountId: string, address: string, message: string) => Promise<string>; openContact: (contactId: string) => Promise<void>; renameContact: (contactId: string, name: string) => Promise<void>; deleteContact: (contactId: string) => Promise<void>; goToAccounts: () => void; t: typeof copy[Language] }) {
   const xmppAccounts = profile.accounts.filter((item) => item.protocol === 'xmpp');
   const toxAccounts = profile.accounts.filter((item) => item.protocol === 'tox');
   const [kind, setKind] = useState<'xmpp' | 'tox'>(xmppAccounts.length > 0 ? 'xmpp' : 'tox');
@@ -917,13 +1014,14 @@ function Contacts({ profile, acceptToxFriend, rejectToxFriend, addXmppContact, a
     } catch (reason) { setFormError(redactError(reason)); }
     finally { setSubmitting(false); }
   };
-  return <div className="content-grid contacts-grid"><section><PageTitle index="03" title={t.contacts} subtitle={profile.name}/>{profile.friendRequests.length > 0 && <section className="friend-requests"><h2>{languageHint(t, 'Запросы', 'Requests')}</h2>{profile.friendRequests.map((request) => <article key={request.id}><span className="chat-avatar"><ToxIcon/></span><span><strong>Tox {request.publicKey.slice(0, 8)}</strong><small>{request.message || languageHint(t, 'Хочет добавить вас', 'Wants to add you')}</small></span><div className="request-actions"><button className="primary compact" onClick={() => void acceptToxFriend(request.id)}>{languageHint(t, 'Принять', 'Accept')}</button><button className="icon-text" onClick={() => void rejectToxFriend(request.id)}>{languageHint(t, 'Отклонить', 'Decline')}</button></div></article>)}</section>}<div className={`contact-list ${profile.contacts.length === 0 ? 'is-empty' : ''}`}>{profile.contacts.map((contact) => <ContactRow key={contact.id} contact={contact} open={() => openContact(contact.id)} rename={(name) => renameContact(contact.id, name)} t={t}/>)}{profile.contacts.length === 0 && profile.friendRequests.length === 0 && <EmptyState title={languageHint(t, 'Контактов пока нет', 'No contacts yet')} text={profile.accounts.length > 0 ? languageHint(t, 'Добавьте первый контакт справа.', 'Add your first contact on the right.') : languageHint(t, 'Сначала подключите XMPP или Tox.', 'Connect XMPP or Tox first.')}/>}</div></section><section className="form-panel contact-add-panel"><h2>{languageHint(t, 'Добавить контакт', 'Add contact')}</h2>{profile.accounts.length === 0 ? <EmptyState title={languageHint(t, 'Нет подключений', 'No connections')} text={languageHint(t, 'Добавьте аккаунт, затем возвращайтесь сюда.', 'Add an account, then return here.')}><button className="primary compact-action" onClick={goToAccounts}>{t.connectAccount}</button></EmptyState> : <><div className="protocol-picker" role="tablist" aria-label={languageHint(t, 'Протокол контакта', 'Contact protocol')}><button role="tab" aria-selected={kind === 'xmpp'} disabled={xmppAccounts.length === 0} className={kind === 'xmpp' ? 'active' : ''} onClick={() => { setKind('xmpp'); setAccountId(xmppAccounts[0]?.id ?? ''); setAddress(''); setFormError(''); }}><span className="protocol-logo xmpp-logo"><XmppIcon/></span><strong>XMPP</strong></button><button role="tab" aria-selected={kind === 'tox'} disabled={toxAccounts.length === 0} className={kind === 'tox' ? 'active' : ''} onClick={() => { setKind('tox'); setAccountId(toxAccounts[0]?.id ?? ''); setAddress(''); setFormError(''); }}><span className="protocol-logo tox-logo"><ToxIcon/></span><strong>Tox</strong></button></div><form className="connect-form" onSubmit={(event) => { event.preventDefault(); void submit(); }}><label>{languageHint(t, 'Ваш аккаунт', 'Your account')}<select value={selectedAccountId} onChange={(event) => setAccountId(event.target.value)} required>{accounts.map((account) => <option key={account.id} value={account.id}>{account.alias}{account.presence === 'online' ? ` · ${languageHint(t, 'в сети', 'online')}` : ''}</option>)}</select></label><label>{kind === 'xmpp' ? languageHint(t, 'Адрес XMPP', 'XMPP address') : 'Tox ID'}<input type={kind === 'xmpp' ? 'email' : 'text'} value={address} onChange={(event) => setAddress(event.target.value.trim())} placeholder={kind === 'xmpp' ? 'friend@example.org' : undefined} minLength={kind === 'tox' ? 76 : undefined} maxLength={kind === 'tox' ? 76 : 320} spellCheck={false} required/></label>{kind === 'xmpp' ? <label>{languageHint(t, 'Имя в приложении', 'Name in the app')}<input value={alias} onChange={(event) => setAlias(event.target.value)} maxLength={128} placeholder={languageHint(t, 'Необязательно', 'Optional')}/></label> : <label>{languageHint(t, 'Сообщение-знакомство', 'Introduction message')}<input value={message} onChange={(event) => setMessage(event.target.value)} maxLength={500}/></label>}<button className="primary" type="submit" disabled={submitting || !selectedAccountId}>{submitting ? languageHint(t, 'Добавляем…', 'Adding…') : kind === 'xmpp' ? languageHint(t, 'Добавить и открыть чат', 'Add and open chat') : languageHint(t, 'Отправить запрос', 'Send request')}</button>{formError && <p className="inline-error" role="alert">{formError}</p>}</form></>}</section></div>;
+  return <div className="content-grid contacts-grid"><section><PageTitle index="03" title={t.contacts} subtitle={profile.name}/>{profile.friendRequests.length > 0 && <section className="friend-requests"><h2>{languageHint(t, 'Запросы', 'Requests')}</h2>{profile.friendRequests.map((request) => <article key={request.id}><span className="chat-avatar"><ToxIcon/></span><span><strong>Tox {request.publicKey.slice(0, 8)}</strong><small>{request.message || languageHint(t, 'Хочет добавить вас', 'Wants to add you')}</small></span><div className="request-actions"><button className="primary compact" onClick={() => void acceptToxFriend(request.id)}>{languageHint(t, 'Принять', 'Accept')}</button><button className="icon-text" onClick={() => void rejectToxFriend(request.id)}>{languageHint(t, 'Отклонить', 'Decline')}</button></div></article>)}</section>}<div className={`contact-list ${profile.contacts.length === 0 ? 'is-empty' : ''}`}>{profile.contacts.map((contact) => <ContactRow key={contact.id} contact={contact} open={() => openContact(contact.id)} rename={(name) => renameContact(contact.id, name)} remove={() => deleteContact(contact.id)} t={t}/>)}{profile.contacts.length === 0 && profile.friendRequests.length === 0 && <EmptyState title={languageHint(t, 'Контактов пока нет', 'No contacts yet')} text={profile.accounts.length > 0 ? languageHint(t, 'Добавьте первый контакт справа.', 'Add your first contact on the right.') : languageHint(t, 'Сначала подключите XMPP или Tox.', 'Connect XMPP or Tox first.')}/>}</div></section><section className="form-panel contact-add-panel"><h2>{languageHint(t, 'Добавить контакт', 'Add contact')}</h2>{profile.accounts.length === 0 ? <EmptyState title={languageHint(t, 'Нет подключений', 'No connections')} text={languageHint(t, 'Добавьте аккаунт, затем возвращайтесь сюда.', 'Add an account, then return here.')}><button className="primary compact-action" onClick={goToAccounts}>{t.connectAccount}</button></EmptyState> : <><div className="protocol-picker" role="tablist" aria-label={languageHint(t, 'Протокол контакта', 'Contact protocol')}><button role="tab" aria-selected={kind === 'xmpp'} disabled={xmppAccounts.length === 0} className={kind === 'xmpp' ? 'active' : ''} onClick={() => { setKind('xmpp'); setAccountId(xmppAccounts[0]?.id ?? ''); setAddress(''); setFormError(''); }}><span className="protocol-logo xmpp-logo"><XmppIcon/></span><strong>XMPP</strong></button><button role="tab" aria-selected={kind === 'tox'} disabled={toxAccounts.length === 0} className={kind === 'tox' ? 'active' : ''} onClick={() => { setKind('tox'); setAccountId(toxAccounts[0]?.id ?? ''); setAddress(''); setFormError(''); }}><span className="protocol-logo tox-logo"><ToxIcon/></span><strong>Tox</strong></button></div><form className="connect-form" onSubmit={(event) => { event.preventDefault(); void submit(); }}><label>{languageHint(t, 'Ваш аккаунт', 'Your account')}<select value={selectedAccountId} onChange={(event) => setAccountId(event.target.value)} required>{accounts.map((account) => <option key={account.id} value={account.id}>{account.alias}{account.presence === 'online' ? ` · ${languageHint(t, 'в сети', 'online')}` : ''}</option>)}</select></label><label>{kind === 'xmpp' ? languageHint(t, 'Адрес XMPP', 'XMPP address') : 'Tox ID'}<input type={kind === 'xmpp' ? 'email' : 'text'} value={address} onChange={(event) => setAddress(event.target.value.trim())} placeholder={kind === 'xmpp' ? 'friend@example.org' : undefined} minLength={kind === 'tox' ? 76 : undefined} maxLength={kind === 'tox' ? 76 : 320} spellCheck={false} required/></label>{kind === 'xmpp' ? <label>{languageHint(t, 'Имя в приложении', 'Name in the app')}<input value={alias} onChange={(event) => setAlias(event.target.value)} maxLength={128} placeholder={languageHint(t, 'Необязательно', 'Optional')}/></label> : <label>{languageHint(t, 'Сообщение-знакомство', 'Introduction message')}<input value={message} onChange={(event) => setMessage(event.target.value)} maxLength={500}/></label>}<button className="primary" type="submit" disabled={submitting || !selectedAccountId}>{submitting ? languageHint(t, 'Добавляем…', 'Adding…') : kind === 'xmpp' ? languageHint(t, 'Добавить и открыть чат', 'Add and open chat') : languageHint(t, 'Отправить запрос', 'Send request')}</button>{formError && <p className="inline-error" role="alert">{formError}</p>}</form></>}</section></div>;
 }
 
-function ContactRow({ contact, open, rename, t }: { contact: Contact; open: () => Promise<void>; rename: (name: string) => Promise<void>; t: typeof copy[Language] }) {
+function ContactRow({ contact, open, rename, remove, t }: { contact: Contact; open: () => Promise<void>; rename: (name: string) => Promise<void>; remove: () => Promise<void>; t: typeof copy[Language] }) {
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState(contact.alias);
   const [saving, setSaving] = useState(false);
+  const context = useContextMenu<Contact>();
   useEffect(() => { if (!editing) setName(contact.alias); }, [contact.alias, editing]);
   const save = async () => {
     const next = name.trim();
@@ -933,7 +1031,12 @@ function ContactRow({ contact, open, rename, t }: { contact: Contact; open: () =
     finally { setSaving(false); }
   };
   if (editing) return <div className="contact-row editing"><span className={`chat-avatar ${contact.protocol}`}>{contact.protocol === 'tox' ? <ToxIcon/> : <XmppIcon/>}</span><form className="contact-rename-form" onSubmit={(event) => { event.preventDefault(); void save(); }}><input autoFocus value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => { if (event.key === 'Escape') { setName(contact.alias); setEditing(false); } }} maxLength={128} aria-label={languageHint(t, 'Имя контакта', 'Contact name')}/><div><button type="button" className="contact-edit-button" onClick={() => { setName(contact.alias); setEditing(false); }} aria-label={languageHint(t, 'Отмена', 'Cancel')}><CancelIcon/></button><button type="submit" className="contact-edit-button save" disabled={saving || !name.trim()} aria-label={languageHint(t, 'Сохранить имя', 'Save name')}><DeliveredIcon/></button></div></form></div>;
-  return <div className="contact-row"><button className="contact-open" onClick={() => void open()}><span className={`chat-avatar ${contact.protocol}`}>{contact.protocol === 'tox' ? <ToxIcon/> : <XmppIcon/>}</span><span className="contact-copy"><strong>{contact.alias}</strong><small>{contact.address}</small></span><span className="contact-tail"><span className={`presence-dot ${contact.presence}`}/><small>{presenceLabel(contact.presence, t)}</small><ArrowIcon/></span></button><button className="contact-edit-button" onClick={() => setEditing(true)} aria-label={languageHint(t, `Переименовать ${contact.alias}`, `Rename ${contact.alias}`)} title={languageHint(t, 'Переименовать', 'Rename')}><EditIcon/></button></div>;
+  return <div className="contact-row" onContextMenu={(event) => context.open(event, contact)}><button className="contact-open" onClick={() => void open()} title={languageHint(t, 'ПКМ — действия с контактом', 'Right-click for contact actions')}><span className={`chat-avatar ${contact.protocol}`}>{contact.protocol === 'tox' ? <ToxIcon/> : <XmppIcon/>}</span><span className="contact-copy"><strong>{contact.alias}</strong><small>{contact.address}</small></span><span className="contact-tail"><span className={`presence-dot ${contact.presence}`}/><small>{presenceLabel(contact.presence, t)}</small><ArrowIcon/></span></button><button className="contact-edit-button" onClick={() => setEditing(true)} aria-label={languageHint(t, `Переименовать ${contact.alias}`, `Rename ${contact.alias}`)} title={languageHint(t, 'Переименовать', 'Rename')}><EditIcon/></button>{context.menu && <ContextMenu state={context.menu} onClose={context.close} items={[
+    { label: languageHint(t, 'Открыть чат', 'Open chat'), action: open },
+    { label: contact.protocol === 'tox' ? 'Копировать Tox ID' : languageHint(t, 'Копировать JID', 'Copy JID'), action: () => navigator.clipboard.writeText(contact.address) },
+    { label: languageHint(t, 'Переименовать', 'Rename'), action: () => setEditing(true) },
+    { label: languageHint(t, 'Удалить контакт', 'Delete contact'), danger: true, action: () => { if (window.confirm(languageHint(t, `Удалить контакт «${contact.alias}» и локальную историю?`, `Delete “${contact.alias}” and local history?`))) return remove(); } },
+  ]}/>}</div>;
 }
 
 function Privacy({ data, profile, network, t, onLock, onWipe, onExport }: { data: VaultData; profile: LocalProfile; network: NetworkActivity[]; t: typeof copy[Language]; onLock: () => void; onWipe: () => Promise<void>; onExport: () => Promise<void> }) {
@@ -993,7 +1096,9 @@ function presenceLabel(presence: LocalProfile['contacts'][number]['presence'], t
   return languageHint(t, ru, en);
 }
 function encryptionLabel(conversation: Conversation, t: typeof copy[Language]): { label: string; tone: 'secure' | 'warning' } {
-  if (conversation.protocol === 'tox') return { label: languageHint(t, 'Tox · сквозное шифрование', 'Tox · end-to-end encrypted'), tone: 'secure' };
+    if (conversation.protocol === 'tox') return { label: languageHint(t, 'Tox · сквозное шифрование', 'Tox · end-to-end encrypted'), tone: 'secure' };
+    if (conversation.encryption?.policy === 'force-omemo' && conversation.encryption.provider !== 'omemo') return { label: languageHint(t, 'OMEMO · выбран', 'OMEMO · selected'), tone: 'warning' };
+    if (conversation.encryption?.policy === 'plaintext') return { label: languageHint(t, 'XMPP · защита TLS', 'XMPP · TLS transport'), tone: 'warning' };
   if (conversation.encryption?.provider === 'omemo') return { label: `OMEMO · ${conversation.encryption.verified ? languageHint(t, 'проверено', 'verified') : languageHint(t, 'не проверено', 'unverified')}`, tone: conversation.encryption.verified ? 'secure' : 'warning' };
   if (conversation.encryption?.provider === 'otr') return { label: `OTR · ${conversation.encryption.verified ? languageHint(t, 'проверено', 'verified') : languageHint(t, 'не проверено', 'unverified')}`, tone: conversation.encryption.verified ? 'secure' : 'warning' };
   return { label: languageHint(t, 'XMPP · защита TLS', 'XMPP · TLS transport'), tone: 'warning' };

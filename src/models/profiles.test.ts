@@ -6,6 +6,7 @@ import {
   deleteProfile,
   duplicateProfileSettings,
   migrateVaultData,
+  normalizeVault,
   reorderProfiles,
   serializableVault,
 } from './profiles';
@@ -22,6 +23,27 @@ describe('multi-profile model', () => {
     });
     expect(migrated.schemaVersion).toBe(2);
     expect(activeProfile(migrated).accounts[0]?.address).toBe('a@test');
+  });
+
+  it('removes exact local duplicates and cross-protocol copies during normalization', () => {
+    const data = createEmptyVault('en');
+    const profile = data.profiles[0]!;
+    profile.accounts.push(
+      { id: 'tox', protocol: 'tox', address: 'tox-id', alias: 'Tox', presence: 'offline', enabled: true },
+      { id: 'xmpp', protocol: 'xmpp', address: 'me@example.org', alias: 'XMPP', presence: 'offline', enabled: true },
+    );
+    profile.contacts.push(
+      { id: 'tc', accountId: 'tox', protocol: 'tox', address: 'A'.repeat(64), alias: 'Tox friend', presence: 'offline' },
+      { id: 'xc', accountId: 'xmpp', protocol: 'xmpp', address: 'friend@example.org', alias: 'XMPP friend', presence: 'offline' },
+    );
+    profile.conversations.push(
+      { id: 'tox-chat', contactId: 'tc', protocol: 'tox', title: 'Tox friend', unread: 0, updatedAt: 1 },
+      { id: 'xmpp-chat', contactId: 'xc', protocol: 'xmpp', title: 'XMPP friend', unread: 0, updatedAt: 1 },
+    );
+    const message = { id: 'a', conversationId: 'tox-chat', direction: 'outgoing' as const, body: 'hello', timestamp: 10, delivery: 'sent' as const, sourceAccountId: 'tox' };
+    profile.messages.push(message, { ...message, id: 'b' }, { ...message, id: 'c', conversationId: 'xmpp-chat' });
+    normalizeVault(data);
+    expect(profile.messages).toEqual([message]);
   });
 
   it('keeps messages, drafts, keys, and contacts isolated', () => {

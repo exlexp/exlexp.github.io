@@ -103,6 +103,8 @@ export interface Message {
   delivery: DeliveryState;
   sourceAccountId?: string;
   encryptionProvider?: EncryptionProviderId;
+  protocolMessageId?: string;
+  protocolPeerId?: string;
 }
 
 export interface ProfileSettings {

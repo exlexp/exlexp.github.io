@@ -16,4 +16,9 @@ describe('encryption policy', () => {
     expect(() => resolveEncryptionProvider('force-omemo', { omemo: false, otr: true })).toThrow(/required but unavailable/i);
     expect(() => resolveEncryptionProvider('force-otr', { omemo: true, otr: false })).toThrow(/required but unavailable/i);
   });
+
+  it('allows TLS-only XMPP only after an explicit chat choice', () => {
+    expect(() => resolveEncryptionProvider('plaintext', { omemo: true, otr: false })).toThrow(/confirmation/i);
+    expect(resolveEncryptionProvider('plaintext', { omemo: true, otr: false }, true)).toBe('plaintext');
+  });
 });

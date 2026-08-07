@@ -13,9 +13,9 @@ export type ToxEvent =
   | { type: 'ready'; address: string; savedata: string; friends: ToxFriend[] }
   | { type: 'savedata'; savedata: string }
   | { type: 'friend-request'; publicKey: string; message: string }
-  | { type: 'friend-connection'; friendNumber: number; online: boolean }
-  | { type: 'message'; friendNumber: number; text: string; timestamp: number }
-  | { type: 'receipt'; friendNumber: number; messageId: number }
+  | { type: 'friend-connection'; friendNumber: number; publicKey: string; online: boolean }
+  | { type: 'message'; friendNumber: number; publicKey: string; text: string; timestamp: number }
+  | { type: 'receipt'; friendNumber: number; publicKey: string; messageId: number }
   | { type: 'transport'; transport: 'udp' | 'tcp'; state: 'created' | 'opening' | 'open' | 'closed' | 'error'; host?: string; port?: number };
 
 export interface ToxFriend {
