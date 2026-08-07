@@ -114,12 +114,12 @@ async function start(savedata: string | undefined, name: string, status: string,
   setUtf8(status, (pointer, length) => module!._relay_tox_set_status(tox, pointer, length));
   postEvent({ type: 'state', state: 'connecting' });
   activeNodes = nodes.filter((item) => item.enabled && isNumericIp(item.host));
-  bootstrapNextRelays();
+  bootstrapNextRelays(activeNodes.length);
   scheduleIteration();
   saveTimer = self.setInterval(emitSavedata, 30_000) as unknown as number;
   bootstrapTimer = self.setInterval(() => {
-    if (!selfOnline) bootstrapNextRelays();
-  }, 20_000) as unknown as number;
+    if (!selfOnline) bootstrapNextRelays(3);
+  }, 12_000) as unknown as number;
   slowConnectionTimer = self.setTimeout(() => {
     if (!selfOnline) postEvent({ type: 'state', state: 'reconnecting' });
   }, 12_000) as unknown as number;
@@ -163,9 +163,9 @@ function bootstrap(node: ToxBootstrapNode): void {
   }));
 }
 
-function bootstrapNextRelays(): void {
+function bootstrapNextRelays(requestedCount = 3): void {
   if (!activeNodes.length) return;
-  const count = Math.min(3, activeNodes.length);
+  const count = Math.min(Math.max(1, requestedCount), activeNodes.length);
   for (let index = 0; index < count; index += 1) {
     const node = activeNodes[(bootstrapOffset + index) % activeNodes.length];
     if (node) bootstrap(node);

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Component, useCallback, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from 'react';
 import { BRAND } from '../config/branding';
 import { activeProfile, createProfile, deleteProfile, duplicateProfileSettings, reorderProfiles } from '../models/profiles';
 import { conversationMatchesQuery, ensureConversation, recordIncomingActivity } from '../models/conversations';
@@ -325,6 +325,8 @@ export function App() {
       }).then(() => { refresh(); if (shouldNotify) showLocalMessageNotification(profileName, conversationTitle, event.text, vault.snapshot.settings.showNotificationPreviews); });
       return;
     }
+    let requestAdded = false;
+    const notificationProfileName = vault.snapshot.profiles.find((item) => item.id === profileId)?.name ?? 'Relayless';
     void vault.update((draft) => {
       const profile = draft.profiles.find((item) => item.id === profileId); if (!profile) return;
       const current = profile.accounts.find((item) => item.id === accountId); if (!current) return;
@@ -348,6 +350,7 @@ export function App() {
       }
       if (event.type === 'friend-request' && !profile.friendRequests.some((item) => item.accountId === accountId && item.publicKey === event.publicKey)) {
         profile.friendRequests.push({ id: crypto.randomUUID(), accountId, protocol: 'tox', publicKey: event.publicKey, message: event.message, receivedAt: Date.now() });
+        requestAdded = true;
       }
       if (event.type === 'friend-connection') {
         const contact = profile.contacts.find((item) => item.accountId === accountId && item.remoteId === String(event.friendNumber));
@@ -357,7 +360,34 @@ export function App() {
         const message = profile.messages.find((item) => item.id === `tox:${accountId}:${event.messageId}`);
         if (message) message.delivery = 'delivered';
       }
-    }).then(refresh).catch((reason) => setError(redactError(reason)));
+    }).then(() => {
+      refresh();
+      if (event.type === 'friend-connection' && event.online) void flushPendingToxMessages(profileId, accountId, event.friendNumber);
+      if (event.type === 'friend-request' && requestAdded) {
+        showLocalMessageNotification(notificationProfileName, languageHint(t, 'Новый запрос Tox', 'New Tox request'), event.message || languageHint(t, 'Хочет добавить вас', 'Wants to add you'), vault.snapshot.settings.showNotificationPreviews);
+      }
+    }).catch((reason) => setError(redactError(reason)));
+  };
+
+  const flushPendingToxMessages = async (profileId: string, accountId: string, friendNumber: number): Promise<void> => {
+    const client = toxClients.current.get(`${profileId}:${accountId}`);
+    if (!client) return;
+    const snapshot = vault.snapshot;
+    const profile = snapshot.profiles.find((item) => item.id === profileId);
+    const contact = profile?.contacts.find((item) => item.accountId === accountId && item.remoteId === String(friendNumber));
+    if (!profile || !contact) return;
+    const conversationIds = new Set(profile.conversations.filter((item) => item.contactId === contact.id).map((item) => item.id));
+    const pending = profile.messages.filter((item) => item.direction === 'outgoing' && item.delivery === 'sending' && item.sourceAccountId === accountId && conversationIds.has(item.conversationId));
+    for (const message of pending) {
+      try {
+        const messageId = await client.sendMessage(friendNumber, message.body);
+        await vault.update((draft) => {
+          const current = draft.profiles.find((item) => item.id === profileId)?.messages.find((item) => item.id === message.id);
+          if (current) { current.id = `tox:${accountId}:${messageId}`; current.delivery = 'sent'; }
+        });
+      } catch { break; }
+    }
+    refresh();
   };
 
   const addXmppContact = async (accountId: string, address: string, alias: string): Promise<string> => {
@@ -456,7 +486,13 @@ export function App() {
         const friendNumber = Number(contact.remoteId);
         if (!Number.isInteger(friendNumber) || friendNumber < 0) throw new Error('Tox contact is not linked to a toxcore friend');
         const client = await connectTox(source, profileId);
-        const messageId = await client.sendMessage(friendNumber, body);
+        let messageId: number;
+        try {
+          messageId = await client.sendMessage(friendNumber, body);
+        } catch {
+          setError(languageHint(t, 'Контакт временно не в сети. Сообщение отправится автоматически после восстановления связи.', 'The contact is temporarily offline. The message will be sent automatically when the connection returns.'));
+          return;
+        }
         sentId = `tox:${sourceAccountId}:${messageId}`;
       } else {
         const client = xmppClients.current.get(`${profileId}:${sourceAccountId}`);
@@ -541,16 +577,18 @@ export function App() {
       <div className="app-grid">
         <aside className="app-sidebar">
           <ProfileRail data={data} scope={profileScope} onAll={() => { setProfileScope('all'); setScreen('chats'); setSelectedConversation(undefined); }} onSelect={(id) => void selectProfile(id)} onCreate={() => void createNewProfile()} onReorder={(draggedId, targetId) => void vault.update((draft) => reorderProfiles(draft, draggedId, targetId)).then(refresh)} onPalette={() => setPaletteOpen(true)}/>
-          <Nav screen={screen} setScreen={setScreen} t={t}/>
+          <Nav screen={screen} setScreen={setScreen} pendingContacts={data.profiles.reduce((count, profile) => count + profile.friendRequests.length, 0)} t={t}/>
           <button className="sidebar-lock" onClick={lock} aria-label={t.lock} title={t.lock}><LockIcon/></button>
         </aside>
         <main className="workspace">
+          <WorkspaceErrorBoundary resetKey={`${screen}:${currentProfile.id}`} language={language}>
           {screen === 'chats' && <Messenger data={data} scope={profileScope} selected={selectedConversation} onBack={() => setSelectedConversation(undefined)} selectConversation={selectConversation} setScreen={setScreen} sendMessage={sendMessage} setSource={setConversationSource} saveDraft={saveDraft} t={t}/>} 
           {screen === 'accounts' && <Accounts profile={currentProfile} addXmpp={addXmpp} connectXmpp={(account) => connectXmpp(account, currentProfile.id)} addTox={addTox} connectTox={(account) => connectTox(account, currentProfile.id)} disconnectAccount={disconnectAccount} removeAccount={removeAccount} t={t}/>} 
           {screen === 'contacts' && <Contacts profile={currentProfile} acceptToxFriend={acceptToxFriend} rejectToxFriend={rejectToxFriend} addXmppContact={addXmppContact} addToxFriend={addToxFriend} openContact={openContact} goToAccounts={() => setScreen('accounts')} t={t}/>} 
           {screen === 'privacy' && <Privacy data={data} profile={currentProfile} network={network} t={t} onLock={lock} onWipe={async () => { await vault.wipe(); setData(undefined); setGate('launch'); }} onExport={async () => downloadText(await vault.exportEncrypted(), 'relayless-vault.rlvault')}/>} 
           {screen === 'plugins' && <Plugins data={data} t={t} onInstall={async (source, granted) => { const manifest = parsePluginManifest(source); await vault.update((draft) => { draft.plugins = installPlugin(manifest, granted, draft.plugins); }); refresh(); }} onToggle={async (id) => { await vault.update((draft) => { const plugin = draft.plugins.find((item) => item.manifest.id === id); if (plugin) plugin.enabled = !plugin.enabled; }); refresh(); }} onRemove={async (id) => { await vault.update((draft) => { draft.plugins = draft.plugins.filter((item) => item.manifest.id !== id); }); refresh(); }}/>} 
           {screen === 'settings' && <Settings data={data} profile={currentProfile} t={t} onSave={updateSettings} onProfileUpdate={async (settings) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.settings = settings; }); refresh(); }} onRename={async (name) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) { profile.name = name; profile.initials = name.slice(0, 2).toUpperCase(); } }); refresh(); }} onPin={async () => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.pinned = !profile.pinned; }); refresh(); }} onAvatar={async (avatar) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.avatar = avatar; }); refresh(); }} onLockProfile={async () => { for (const account of currentProfile.accounts) { const key = `${currentProfile.id}:${account.id}`; xmppClients.current.get(key)?.stop(); xmppClients.current.delete(key); void toxClients.current.get(key)?.stop(); toxClients.current.delete(key); } await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) { profile.locked = true; profile.runtimeState = 'locked'; } }); refresh(); setProfileScope('all'); setSelectedConversation(undefined); setScreen('chats'); }} onDuplicate={async () => { await vault.update((draft) => duplicateProfileSettings(draft, currentProfile.id, `${currentProfile.name} copy`)); refresh(); }} onEphemeral={() => void createNewProfile(true)} onDelete={async () => { for (const account of currentProfile.accounts) { const key = `${currentProfile.id}:${account.id}`; xmppClients.current.get(key)?.stop(); void toxClients.current.get(key)?.stop(); } await vault.update((draft) => deleteProfile(draft, currentProfile.id)); refresh(); }} onExportProfile={async () => downloadText(await vault.exportProfile(currentProfile.id), `${safeFilename(currentProfile.name)}.rlprofile`)} onImportProfile={async (text) => { const id = await vault.importProfile(text); refresh(); await selectProfile(id); }}/>} 
+          </WorkspaceErrorBoundary>
         </main>
       </div>
       <CommandPalette open={paletteOpen} profiles={data.profiles} pluginCommands={availablePluginCommands(data.plugins)} onPluginCommand={(action) => { const screens: Record<typeof action, Screen> = { 'open-chats': 'chats', 'open-accounts': 'accounts', 'open-contacts': 'contacts', 'open-settings': 'settings' }; setScreen(screens[action]); }} onClose={() => setPaletteOpen(false)} onProfile={(id) => void selectProfile(id)} onScope={setProfileScope} onCreate={() => void createNewProfile()}/>
@@ -559,9 +597,29 @@ export function App() {
   );
 }
 
-function Nav({ screen, setScreen, t }: { screen: Screen; setScreen: (value: Screen) => void; t: typeof copy[Language] }) {
+function Nav({ screen, setScreen, pendingContacts, t }: { screen: Screen; setScreen: (value: Screen) => void; pendingContacts: number; t: typeof copy[Language] }) {
   const items: Array<[Screen, string, typeof ChatIcon]> = [['chats', t.chats, ChatIcon], ['accounts', t.accounts, AccountsIcon], ['contacts', t.contacts, ContactsIcon], ['privacy', t.privacy, ShieldIcon], ['plugins', languageHint(t, 'Расширения', 'Extensions'), PluginsIcon], ['settings', t.settings, SettingsIcon]];
-  return <nav className="rail" aria-label="Primary">{items.map(([id, label, ItemIcon]) => <button key={id} className={screen === id ? 'active' : ''} onClick={() => setScreen(id)} aria-label={label} title={label}><ItemIcon/><span>{label}</span></button>)}</nav>;
+  return <nav className="rail" aria-label="Primary">{items.map(([id, label, ItemIcon]) => <button key={id} className={screen === id ? 'active' : ''} onClick={() => setScreen(id)} aria-label={label} title={label}><span className="nav-icon"><ItemIcon/>{id === 'contacts' && pendingContacts > 0 && <span className="nav-badge" aria-label={`${pendingContacts}`}>{pendingContacts > 99 ? '99+' : pendingContacts}</span>}</span><span>{label}</span></button>)}</nav>;
+}
+
+class WorkspaceErrorBoundary extends Component<{ resetKey: string; language: Language; children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+
+  static getDerivedStateFromError(): { failed: boolean } { return { failed: true }; }
+
+  componentDidCatch(_error: Error, _info: ErrorInfo): void {
+    // Keep active protocol clients mounted while only the failed view is restored.
+  }
+
+  componentDidUpdate(previous: Readonly<{ resetKey: string }>): void {
+    if (previous.resetKey !== this.props.resetKey && this.state.failed) this.setState({ failed: false });
+  }
+
+  render(): ReactNode {
+    if (!this.state.failed) return this.props.children;
+    const ru = this.props.language === 'ru';
+    return <section className="workspace-error" role="alert"><strong>{ru ? 'Не удалось показать этот экран' : 'This screen could not be shown'}</strong><p>{ru ? 'Соединение продолжает работать. Верните интерфейс без обновления страницы.' : 'The connection is still running. Restore the interface without reloading the page.'}</p><button className="primary compact" onClick={() => this.setState({ failed: false })}>{ru ? 'Вернуть экран' : 'Restore screen'}</button></section>;
+  }
 }
 
 function FirstLaunch({ language, setLanguage, error, createPersistent, createEphemeral }: { language: Language; setLanguage: (value: Language) => void; error: string; createPersistent: (password: string) => Promise<void>; createEphemeral: () => void }) {
@@ -597,8 +655,8 @@ function Messenger({ data, scope, selected, onBack, selectConversation, setScree
 function ActiveChat({ profile, conversation, messages, onBack, send, setSource, saveDraft, t }: { profile: LocalProfile; conversation: Conversation; messages: Message[]; onBack: () => void; send: (profileId: string, conversation: Conversation, body: string, sourceAccountId: string) => Promise<void>; setSource: (profileId: string, conversationId: string, accountId: string) => Promise<void>; saveDraft: (profileId: string, conversationId: string, body: string) => Promise<void>; t: typeof copy[Language] }) {
   const [body, setBody] = useState(profile.drafts[conversation.id] ?? '');
   const messagesEnd = useRef<HTMLDivElement>(null);
-  useEffect(() => setBody(profile.drafts[conversation.id] ?? ''), [conversation.id, profile.drafts]);
-  useEffect(() => messagesEnd.current?.scrollIntoView?.({ block: 'end' }), [conversation.id, messages.length]);
+  useEffect(() => { setBody(profile.drafts[conversation.id] ?? ''); }, [conversation.id, profile.drafts]);
+  useEffect(() => { messagesEnd.current?.scrollIntoView?.({ block: 'end' }); }, [conversation.id, messages.length]);
   const identities = profile.accounts.filter((account) => account.protocol === conversation.protocol);
   const sourceId = conversation.sourceAccountId ?? profile.ui.lastChannelByConversation[conversation.id] ?? (identities.length === 1 ? identities[0]?.id : undefined) ?? '';
   const contact = profile.contacts.find((item) => item.id === conversation.contactId);
@@ -736,6 +794,7 @@ function accountConnectionRunning(account: Account): boolean {
 function accountConnectionLabel(account: Account, t: typeof copy[Language]): string {
   if (account.protocol === 'tox' && !hasToxTransport()) return languageHint(t, 'Нет сети', 'No network');
   const state = account.connectionState ?? account.presence;
+  if (account.protocol === 'tox' && state === 'online') return languageHint(t, 'Сеть Tox подключена', 'Tox network connected');
   const labels: Record<string, [string, string]> = {
     offline: ['Не подключён', 'Offline'], starting: ['Запускается…', 'Starting…'], connecting: ['Подключение…', 'Connecting…'], authenticating: ['Вход…', 'Signing in…'], online: ['В сети', 'Online'], reconnecting: ['Переподключение…', 'Reconnecting…'], error: ['Ошибка подключения', 'Connection error'],
   };

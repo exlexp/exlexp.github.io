@@ -64,9 +64,15 @@ input:focus, textarea:focus, select:focus { border-color: var(--chat-blue); box-
 .profile-rail-actions svg { width: 19px; }
 .rail { display: flex; flex-direction: column; padding-top: 4px; border-top: 1px solid rgba(255,255,255,.08); }
 .rail button { height: 56px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; }
-.rail button span { display: block; max-width: 72px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; line-height: 1.1; }
+.rail button > span:last-child { display: block; max-width: 72px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; line-height: 1.1; }
+.nav-icon { position: relative; display: grid; place-content: center; }
+.nav-badge { position: absolute; top: -7px; right: -10px; min-width: 16px; height: 16px; padding: 0 4px; display: grid; place-content: center; border: 2px solid var(--chat-sidebar); border-radius: 9px; background: var(--chat-danger); color: #fff; font-size: 9px; font-weight: 700; line-height: 1; }
 .rail button svg, .sidebar-lock svg { width: 20px; }
 .sidebar-lock { height: 52px; border-top: 1px solid rgba(255,255,255,.08); }
+
+.workspace-error { min-height: 100%; padding: 32px; display: grid; place-content: center; justify-items: center; text-align: center; background: var(--chat-canvas); }
+.workspace-error strong { font-size: 18px; }
+.workspace-error p { max-width: 420px; margin: 8px 0 18px; color: var(--chat-muted); line-height: 1.45; }
 
 .messenger-grid { height: 100%; min-height: 0; display: grid; grid-template-columns: 360px minmax(0, 1fr); }
 .conversation-panel { min-height: 0; display: flex; flex-direction: column; border-right: 1px solid var(--chat-line); background: var(--chat-paper); }
@@ -360,7 +366,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--chat-blue); box-
   .profile-item { height: 54px; }
   .profile-avatar { width: 36px; height: 36px; }
   .rail button { height: 48px; gap: 2px; }
-  .rail button span { display: block; max-width: 52px; font-size: 7px; }
+  .rail button > span:last-child { display: block; max-width: 52px; font-size: 7px; }
   .messenger-grid { display: block; height: 100%; }
   .conversation-panel { height: 100%; border-right: 0; }
   .chat-panel { display: none; height: 100%; }
