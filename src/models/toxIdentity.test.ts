@@ -17,4 +17,11 @@ describe('Tox stable contact identity', () => {
     expect(resolveToxContact(profile, 'tox', 7, 'c'.repeat(64), false)?.id).toBe('known');
     expect(profile.contacts[0]?.remoteId).toBe('7');
   });
+
+  it('does not unlink a local contact when a recovery snapshot is incomplete', () => {
+    const profile = createEmptyVault('en').profiles[0]!;
+    profile.contacts.push({ id: 'new', accountId: 'tox', protocol: 'tox', address: 'D'.repeat(64), alias: 'New', presence: 'online', remoteId: '2' });
+    reconcileToxFriends(profile, 'tox', []);
+    expect(profile.contacts[0]).toMatchObject({ id: 'new', remoteId: '2', presence: 'offline' });
+  });
 });

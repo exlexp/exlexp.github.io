@@ -57,6 +57,13 @@ export class XmppStreamManager {
     return [...this.unacknowledged];
   }
 
+  recoverForFreshStream(serverCount?: number): string[] {
+    if (serverCount !== undefined) this.acknowledge(serverCount);
+    const pending = [...this.unacknowledged];
+    this.reset();
+    return pending;
+  }
+
   reset(): void {
     this.sessionId = '';
     this.canResume = false;

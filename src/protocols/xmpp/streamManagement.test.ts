@@ -19,4 +19,14 @@ describe('XEP-0198 stream management', () => {
     manager.track('<presence/>');
     expect(() => manager.acknowledge(2)).toThrow(/unsent/i);
   });
+
+  it('preserves only unacknowledged stanzas when resumption is rejected', () => {
+    const manager = new XmppStreamManager();
+    manager.enable('id', true);
+    manager.track('<message id="one"/>');
+    manager.track('<message id="two"/>');
+    expect(manager.recoverForFreshStream(1)).toEqual(['<message id="two"/>']);
+    expect(manager.enabled).toBe(false);
+    expect(manager.resumable).toBe(false);
+  });
 });

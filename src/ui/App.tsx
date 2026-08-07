@@ -356,7 +356,13 @@ export function App() {
   const initializeOmemo = async (client: XmppClient, account: Account, profileId: string): Promise<OmemoEngine> => {
     const key = `${profileId}:${account.id}`;
     const existing = omemoEngines.current.get(key);
-    if (existing) return existing;
+    if (existing) {
+      // A second client can overwrite a PEP device list while this browser is
+      // disconnected. Re-announce both modern and Dino-compatible legacy
+      // bundles after every successful stream recovery.
+      await existing.announce();
+      return existing;
+    }
     const pending = omemoInitializations.current.get(key);
     if (pending) return pending;
     const initialization = (async () => {
@@ -596,7 +602,7 @@ export function App() {
         requestAdded = true;
       }
       if (event.type === 'friend-connection') {
-        const contact = resolveToxContact(profile, accountId, event.friendNumber, event.publicKey, false);
+        const contact = resolveToxContact(profile, accountId, event.friendNumber, event.publicKey, true);
         if (contact) contact.presence = event.online ? 'online' : 'offline';
       }
       if (event.type === 'receipt') {
@@ -663,11 +669,9 @@ export function App() {
     let contactId = '';
     await vault.update((draft) => {
       const profile = draft.profiles.find((item) => item.id === profileId); if (!profile) return;
-      let contact = profile.contacts.find((item) => item.accountId === accountId && item.remoteId === String(friendNumber));
-      if (!contact) {
-        contact = { id: crypto.randomUUID(), accountId, protocol: 'tox', address: address.slice(0, 64).toUpperCase(), alias: `Tox ${address.slice(0, 8).toUpperCase()}`, presence: 'offline', remoteId: String(friendNumber) };
-        profile.contacts.push(contact);
-      }
+      const publicKey = address.slice(0, 64).toUpperCase();
+      const contact = resolveToxContact(profile, accountId, friendNumber, publicKey, true);
+      if (!contact) throw new Error('Tox contact could not be saved');
       contactId = contact.id;
     });
     refresh();
@@ -684,7 +688,7 @@ export function App() {
     await vault.update((draft) => {
       const profile = draft.profiles.find((item) => item.id === profileId); if (!profile) return;
       profile.friendRequests = profile.friendRequests.filter((item) => item.id !== requestId);
-      profile.contacts.push({ id: crypto.randomUUID(), accountId: account.id, protocol: 'tox', address: request.publicKey, alias: `Tox ${request.publicKey.slice(0, 8)}`, presence: 'offline', remoteId: String(friendNumber) });
+      if (!resolveToxContact(profile, account.id, friendNumber, request.publicKey, true)) throw new Error('Tox contact could not be saved');
     });
     refresh();
   };
@@ -748,6 +752,7 @@ export function App() {
       } else {
         const client = xmppClients.current.get(`${profileId}:${sourceAccountId}`);
         if (!client) throw new Error(languageHint(t, 'Сначала подключите XMPP-аккаунт.', 'Connect the XMPP account first.'));
+        await client.waitUntilOnline(25_000);
         if (provider === 'omemo') {
           const engine = omemoEngines.current.get(`${profileId}:${sourceAccountId}`);
           if (!engine) throw new Error('OMEMO is not ready; message was not sent');

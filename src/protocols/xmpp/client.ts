@@ -46,6 +46,16 @@ interface PendingIq {
   timer: number;
 }
 
+interface OnlineWaiter {
+  resolve: () => void;
+  reject: (error: Error) => void;
+  timer: number;
+}
+
+const HEARTBEAT_INTERVAL_MS = 30_000;
+const HEARTBEAT_TIMEOUT_MS = 10_000;
+const CONNECTION_DEADLINE_MS = 20_000;
+
 export class XmppIqError extends Error {
   constructor(
     message: string,
@@ -72,7 +82,13 @@ export class XmppClient {
   private readonly stream = new XmppStreamManager();
   private serverSupportsStreamManagement = false;
   private readonly pendingIq = new Map<string, PendingIq>();
+  private readonly onlineWaiters = new Set<OnlineWaiter>();
   private omemoDeviceId: number | undefined;
+  private heartbeatTimer: number | undefined;
+  private connectionDeadline: number | undefined;
+  private heartbeatRunning = false;
+  private recoveryQueue: string[] = [];
+  private runtimeListenersInstalled = false;
 
   subscribe(listener: Listener): () => void {
     this.listeners.add(listener);
@@ -87,19 +103,42 @@ export class XmppClient {
     this.credentials = { ...credentials, jid: `${jid.local}@${jid.domain}` };
     this.stopped = false;
     this.reconnectAttempt = 0;
+    this.installRuntimeListeners();
     this.openSocket();
+  }
+
+  waitUntilOnline(timeoutMs = 20_000): Promise<void> {
+    if (this.bound && this.socket?.readyState === WebSocket.OPEN) return Promise.resolve();
+    if (this.stopped) return Promise.reject(new Error('XMPP account is disconnected'));
+    return new Promise<void>((resolve, reject) => {
+      const waiter: OnlineWaiter = {
+        resolve,
+        reject,
+        timer: window.setTimeout(() => {
+          this.onlineWaiters.delete(waiter);
+          reject(new Error('XMPP connection did not recover in time'));
+        }, timeoutMs),
+      };
+      this.onlineWaiters.add(waiter);
+      this.reconnectNow();
+    });
   }
 
   stop(): void {
     this.stopped = true;
     if (this.reconnectTimer) window.clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
+    this.clearHeartbeat();
+    this.clearConnectionDeadline();
+    this.removeRuntimeListeners();
     this.socket?.close(1000, 'Local account disconnected');
     this.socket = undefined;
     if (this.activityId) networkPolicy.setState(this.activityId, 'closed');
     this.resetSession();
     this.stream.reset();
     this.rejectPendingIq(new Error('XMPP account disconnected'));
+    this.rejectOnlineWaiters(new Error('XMPP account disconnected'));
+    this.recoveryQueue = [];
     this.emit({ type: 'state', state: 'offline' });
   }
 
@@ -213,6 +252,9 @@ export class XmppClient {
 
   private openSocket(): void {
     if (!this.credentials || this.stopped) return;
+    if (this.socket?.readyState === WebSocket.OPEN || this.socket?.readyState === WebSocket.CONNECTING) return;
+    if (this.reconnectTimer) window.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
     const endpoint = new URL(this.credentials.endpoint);
     this.resetSession();
     this.emit({ type: 'state', state: this.reconnectAttempt ? 'reconnecting' : 'connecting' });
@@ -226,16 +268,34 @@ export class XmppClient {
     try {
       this.socket = privateWebSocket(endpoint, 'xmpp', 'xmpp-provider');
     } catch (error) {
-      this.fail(redactError(error));
+      if (this.activityId) networkPolicy.setState(this.activityId, 'failed');
+      this.emit({ type: 'state', state: 'reconnecting', detail: redactError(error) });
+      this.scheduleReconnect();
       return;
     }
-    this.socket.addEventListener('open', () => {
+    const socket = this.socket;
+    this.connectionDeadline = window.setTimeout(() => {
+      if (this.socket === socket && !this.bound) socket.close();
+    }, CONNECTION_DEADLINE_MS);
+    socket.addEventListener('open', () => {
+      if (this.socket !== socket) return;
       if (this.activityId) networkPolicy.setState(this.activityId, 'open');
       this.openStream();
     });
-    this.socket.addEventListener('message', (event) => this.handleFrame(String(event.data)));
-    this.socket.addEventListener('error', () => this.fail('Secure WebSocket connection failed'));
-    this.socket.addEventListener('close', () => {
+    socket.addEventListener('message', (event) => {
+      if (this.socket === socket) void this.handleFrame(String(event.data));
+    });
+    socket.addEventListener('error', () => {
+      if (this.socket !== socket) return;
+      if (this.activityId) networkPolicy.setState(this.activityId, 'failed');
+      socket.close();
+    });
+    socket.addEventListener('close', () => {
+      if (this.socket !== socket) return;
+      this.socket = undefined;
+      this.clearHeartbeat();
+      this.clearConnectionDeadline();
+      this.rejectPendingIq(new Error('XMPP connection was interrupted'));
       if (this.activityId) networkPolicy.setState(this.activityId, 'closed');
       if (!this.stopped) { this.stream.suspend(); this.scheduleReconnect(); }
     });
@@ -288,7 +348,10 @@ export class XmppClient {
           const pending = this.stream.resume(Number(element.getAttribute('h') ?? '0'));
           this.bound = true;
           this.reconnectAttempt = 0;
+          this.clearConnectionDeadline();
           for (const stanza of pending) this.send(stanza, false);
+          this.startHeartbeat();
+          this.resolveOnlineWaiters();
           this.emit({ type: 'state', state: 'online' });
           break;
         }
@@ -299,7 +362,7 @@ export class XmppClient {
           this.send(`<a xmlns="urn:xmpp:sm:3" h="${this.stream.inboundCount}"/>`, false);
           break;
         case 'failed':
-          this.stream.reset();
+          this.recoveryQueue.push(...this.stream.recoverForFreshStream(optionalCounter(element.getAttribute('h'))));
           this.bound = false;
           this.requestBinding();
           break;
@@ -354,6 +417,12 @@ export class XmppClient {
       this.pendingIq.delete(id);
       if (iq.getAttribute('type') === 'error') pending.reject(createXmppIqError(iq));
       else pending.resolve(iq);
+      return;
+    }
+    const ping = descendants(iq, 'ping').find((item) => item.namespaceURI === 'urn:xmpp:ping');
+    if (ping && iq.getAttribute('type') === 'get' && id) {
+      const from = iq.getAttribute('from');
+      this.send(`<iq type="result" id="${escapeXml(id)}"${from ? ` to="${escapeXml(from)}"` : ''}/>`, true);
       return;
     }
     if (id === 'bind-1' && iq.getAttribute('type') === 'result') {
@@ -476,12 +545,17 @@ export class XmppClient {
 
   private finishOnline(): void {
     this.reconnectAttempt = 0;
+    this.clearConnectionDeadline();
     this.send('<iq type="get" id="roster-1"><query xmlns="jabber:iq:roster"/></iq>');
     this.send('<presence/>');
     if (this.credentials?.restoreArchive) {
       const start = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
       this.send(`<iq type="set" id="mam-${crypto.randomUUID()}"><query xmlns="urn:xmpp:mam:2"><x xmlns="jabber:x:data" type="submit"><field var="FORM_TYPE" type="hidden"><value>urn:xmpp:mam:2</value></field><field var="start"><value>${escapeXml(start)}</value></field></x><set xmlns="http://jabber.org/protocol/rsm"><max>100</max></set></query></iq>`);
     }
+    const recovering = this.recoveryQueue.splice(0);
+    for (const stanza of recovering) this.send(stanza);
+    this.startHeartbeat();
+    this.resolveOnlineWaiters();
     this.emit({ type: 'state', state: 'online' });
   }
 
@@ -502,11 +576,90 @@ export class XmppClient {
   }
 
   private scheduleReconnect(): void {
+    if (this.stopped || this.reconnectTimer) return;
     this.reconnectAttempt += 1;
-    const delay = Math.min(30_000, 1_000 * 2 ** Math.min(this.reconnectAttempt - 1, 5));
+    const delay = Math.min(12_000, 1_000 * 2 ** Math.min(this.reconnectAttempt - 1, 4));
     if (this.activityId) networkPolicy.setState(this.activityId, 'retrying');
     this.emit({ type: 'state', state: 'reconnecting', detail: `Retry in ${Math.ceil(delay / 1000)}s` });
-    this.reconnectTimer = window.setTimeout(() => this.openSocket(), delay);
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = undefined;
+      this.openSocket();
+    }, delay);
+  }
+
+  private reconnectNow = (): void => {
+    if (this.stopped) return;
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      if (this.bound) void this.runHeartbeat();
+      return;
+    }
+    if (this.socket?.readyState === WebSocket.CONNECTING) return;
+    if (this.reconnectTimer) window.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    this.openSocket();
+  };
+
+  private startHeartbeat(): void {
+    this.clearHeartbeat();
+    this.heartbeatTimer = window.setTimeout(() => void this.runHeartbeat(), HEARTBEAT_INTERVAL_MS);
+  }
+
+  private async runHeartbeat(): Promise<void> {
+    if (this.heartbeatRunning || this.stopped || !this.bound || this.socket?.readyState !== WebSocket.OPEN) return;
+    this.clearHeartbeat();
+    this.heartbeatRunning = true;
+    try {
+      await this.requestIq('<ping xmlns="urn:xmpp:ping"/>', { timeoutMs: HEARTBEAT_TIMEOUT_MS });
+    } catch (error) {
+      if (!(error instanceof XmppIqError)) this.socket?.close();
+    } finally {
+      this.heartbeatRunning = false;
+      if (!this.stopped && this.bound && this.socket?.readyState === WebSocket.OPEN) this.startHeartbeat();
+    }
+  }
+
+  private clearHeartbeat(): void {
+    if (this.heartbeatTimer) window.clearTimeout(this.heartbeatTimer);
+    this.heartbeatTimer = undefined;
+  }
+
+  private clearConnectionDeadline(): void {
+    if (this.connectionDeadline) window.clearTimeout(this.connectionDeadline);
+    this.connectionDeadline = undefined;
+  }
+
+  private installRuntimeListeners(): void {
+    if (this.runtimeListenersInstalled) return;
+    window.addEventListener('online', this.reconnectNow);
+    document.addEventListener('visibilitychange', this.handleVisibilityChange);
+    this.runtimeListenersInstalled = true;
+  }
+
+  private removeRuntimeListeners(): void {
+    if (!this.runtimeListenersInstalled) return;
+    window.removeEventListener('online', this.reconnectNow);
+    document.removeEventListener('visibilitychange', this.handleVisibilityChange);
+    this.runtimeListenersInstalled = false;
+  }
+
+  private handleVisibilityChange = (): void => {
+    if (document.visibilityState === 'visible') this.reconnectNow();
+  };
+
+  private resolveOnlineWaiters(): void {
+    for (const waiter of this.onlineWaiters) {
+      window.clearTimeout(waiter.timer);
+      waiter.resolve();
+    }
+    this.onlineWaiters.clear();
+  }
+
+  private rejectOnlineWaiters(error: Error): void {
+    for (const waiter of this.onlineWaiters) {
+      window.clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+    this.onlineWaiters.clear();
   }
 
   private resetSession(): void {
@@ -538,6 +691,12 @@ function archiveHint(allowServerArchive: boolean): string {
   return allowServerArchive
     ? '<store xmlns="urn:xmpp:hints"/>'
     : '<no-permanent-store xmlns="urn:xmpp:hints"/>';
+}
+
+function optionalCounter(value: string | null): number | undefined {
+  if (value === null || value === '') return undefined;
+  const counter = Number(value);
+  return Number.isInteger(counter) && counter >= 0 && counter < 2 ** 32 ? counter : undefined;
 }
 
 function parseJid(jid: string): { local: string; domain: string } {

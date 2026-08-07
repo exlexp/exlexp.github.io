@@ -1,3 +1,4 @@
+import { privateFetch } from '../../network/privateTransport';
 import { parseSafeXmlDocument } from './xml';
 
 const WEBSOCKET_REL = 'urn:xmpp:alt-connections:websocket';
@@ -124,4 +125,3 @@ function addEndpoint(target: DiscoveredXmppEndpoint[], href: string, source: Xmp
     if (!target.some((item) => item.url === normalized)) target.push({ url: normalized, source });
   } catch { /* Invalid advertisements are ignored. */ }
 }
-import { privateFetch } from '../../network/privateTransport';

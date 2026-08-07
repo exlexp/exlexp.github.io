@@ -8,10 +8,11 @@ function normalizedKey(value: string): string {
 export function reconcileToxFriends(profile: LocalProfile, accountId: string, friends: ToxFriend[]): void {
   const activeKeys = new Set(friends.map((friend) => normalizedKey(friend.publicKey)));
   for (const contact of profile.contacts) {
-    if (contact.protocol === 'tox' && contact.accountId === accountId && !contact.address.startsWith('friend:') && !activeKeys.has(normalizedKey(contact.address))) {
-      contact.remoteId = undefined;
-      contact.presence = 'offline';
-    }
+    // A toxcore snapshot is useful for binding live friend numbers, but it must
+    // never be treated as permission to delete or unlink a locally saved contact.
+    // During startup/recovery an incomplete snapshot can otherwise make a newly
+    // added chat disappear or become unsendable until the next full restart.
+    if (contact.protocol === 'tox' && contact.accountId === accountId && !activeKeys.has(normalizedKey(contact.address))) contact.presence = 'offline';
   }
   for (const friend of friends) resolveToxContact(profile, accountId, friend.friendNumber, friend.publicKey, true);
 }

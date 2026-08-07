@@ -111,6 +111,18 @@ describe('XMPP client contact flow', () => {
     expect(events).toContainEqual({ type: 'omemo-devices', from: 'friend@example.org', namespace: 'urn:xmpp:omemo:2', deviceIds: [7, 11] });
   });
 
+  it('answers server XEP-0199 pings so the WebSocket is not treated as idle', async () => {
+    const sent: string[] = [];
+    const client = new XmppClient();
+    const harness = client as unknown as {
+      socket: { readyState: number; send(value: string): void };
+      handleFrame(xml: string): Promise<void>;
+    };
+    harness.socket = { readyState: WebSocket.OPEN, send: (value) => sent.push(value) };
+    await harness.handleFrame('<iq from="example.org" type="get" id="keepalive-1"><ping xmlns="urn:xmpp:ping"/></iq>');
+    expect(sent).toContain('<iq type="result" id="keepalive-1" to="example.org"/>');
+  });
+
   it('parses Dino-compatible legacy OMEMO device notifications', async () => {
     const client = new XmppClient();
     const events: unknown[] = [];
