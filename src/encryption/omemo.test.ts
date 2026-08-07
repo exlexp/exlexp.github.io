@@ -4,11 +4,15 @@ import { JSDOM } from 'jsdom';
 import type { OmemoAccountState } from '../models/types';
 import type { XmppClient, XmppOmemoPayload } from '../protocols/xmpp/client';
 import { parseXmppElement } from '../protocols/xmpp/xml';
-import { OmemoEngine } from './omemo';
+import { OmemoEngine, OmemoUnavailableError } from './omemo';
 
 class PepServer {
   private readonly devices = new Map<string, string>();
   private readonly bundles = new Map<string, string>();
+
+  setDevices(jid: string, ids: number[]): void {
+    this.devices.set(jid, `<devices xmlns="urn:xmpp:omemo:2">${ids.map((id) => `<device id="${id}"/>`).join('')}</devices>`);
+  }
 
   client(jid: string): XmppClient {
     return {
@@ -68,5 +72,33 @@ describe('OMEMO engine', () => {
     expect(decrypted.fingerprint).toMatch(/[0-9a-f]{8}/);
     expect(aliceState?.store).toBeTruthy();
     expect(bobState?.store).toBeTruthy();
+  }, 30_000);
+
+  it('refreshes the list and skips an orphaned device without aborting reachable recipients', async () => {
+    const dom = new JSDOM('');
+    Object.assign(globalThis, { DOMParser: dom.window.DOMParser, XMLSerializer: dom.window.XMLSerializer });
+    const pep = new PepServer();
+    const alice = await OmemoEngine.open(pep.client('alice@example.test'), 'alice@example.test', undefined, async () => undefined);
+    const bob = await OmemoEngine.open(pep.client('bob@example.test'), 'bob@example.test', undefined, async () => undefined);
+    await alice.announce();
+    await bob.announce();
+    pep.setDevices('bob@example.test', [bob.deviceId, 424242]);
+
+    const outbound = await alice.encrypt('bob@example.test', 'still encrypted');
+
+    expect(outbound.devices.some((device) => device.jid === 'bob@example.test' && device.deviceId === bob.deviceId)).toBe(true);
+    expect(outbound.skippedDevices).toContainEqual({ jid: 'bob@example.test', deviceId: 424242 });
+    expect(outbound.xml).not.toContain('still encrypted');
+  }, 30_000);
+
+  it('refuses to send when every advertised recipient device is orphaned', async () => {
+    const dom = new JSDOM('');
+    Object.assign(globalThis, { DOMParser: dom.window.DOMParser, XMLSerializer: dom.window.XMLSerializer });
+    const pep = new PepServer();
+    const alice = await OmemoEngine.open(pep.client('alice@example.test'), 'alice@example.test', undefined, async () => undefined);
+    await alice.announce();
+    pep.setDevices('bob@example.test', [424242]);
+
+    await expect(alice.encrypt('bob@example.test', 'must not leak')).rejects.toBeInstanceOf(OmemoUnavailableError);
   }, 30_000);
 });

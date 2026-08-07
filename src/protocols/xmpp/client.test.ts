@@ -37,6 +37,27 @@ describe('XMPP client contact flow', () => {
     expect(sent[0]).not.toContain('no-store');
   });
 
+  it('marks OMEMO 2 messages for interoperable encryption discovery', () => {
+    const sent: string[] = [];
+    const client = new XmppClient();
+    const harness = client as unknown as { bound: boolean; socket: { readyState: number; send(value: string): void } };
+    harness.bound = true;
+    harness.socket = { readyState: WebSocket.OPEN, send: (value) => sent.push(value) };
+    client.sendEncryptedMessage('friend@example.org', '<encrypted xmlns="urn:xmpp:omemo:2"/>');
+    expect(sent[0]).toContain('xmlns="urn:xmpp:eme:0"');
+    expect(sent[0]).toContain('namespace="urn:xmpp:omemo:2"');
+    expect(sent[0]).not.toContain('<body>');
+  });
+
+  it('updates OMEMO device lists from PEP pushes', async () => {
+    const client = new XmppClient();
+    const events: unknown[] = [];
+    client.subscribe((event) => events.push(event));
+    const harness = client as unknown as { handleFrame(xml: string): Promise<void> };
+    await harness.handleFrame('<message from="friend@example.org" type="headline"><event xmlns="http://jabber.org/protocol/pubsub#event"><items node="urn:xmpp:omemo:2:devices"><item id="current"><devices xmlns="urn:xmpp:omemo:2"><device id="7"/><device id="11"/></devices></item></items></event></message>');
+    expect(events).toContainEqual({ type: 'omemo-devices', from: 'friend@example.org', deviceIds: [7, 11] });
+  });
+
   it('removes a roster contact and both subscription directions', () => {
     const sent: string[] = [];
     const client = new XmppClient();

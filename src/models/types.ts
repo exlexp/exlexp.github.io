@@ -80,7 +80,8 @@ export interface ConversationEncryption {
   provider: EncryptionProviderId;
   verified: boolean;
   devices: EncryptionDevice[];
-  warning?: 'first-use' | 'changed-device' | 'tls-only' | 'plaintext' | 'unavailable';
+  warning?: 'first-use' | 'changed-device' | 'stale-device' | 'tls-only' | 'plaintext' | 'unavailable';
+  skippedDevices?: number;
 }
 
 export interface Conversation {

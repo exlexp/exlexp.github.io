@@ -23,6 +23,7 @@ export type XmppEvent =
   | { type: 'message-error'; id: string; from: string; detail: string }
   | { type: 'presence'; from: string; show: string }
   | { type: 'chat-state'; from: string; state: 'active' | 'composing' | 'paused' | 'inactive' | 'gone' }
+  | { type: 'omemo-devices'; from: string; deviceIds: number[] }
   | { type: 'roster'; contacts: Array<{ jid: string; name: string }> };
 
 type Listener = (event: XmppEvent) => void;
@@ -39,6 +40,17 @@ interface PendingIq {
   resolve: (element: Element) => void;
   reject: (error: Error) => void;
   timer: number;
+}
+
+export class XmppIqError extends Error {
+  constructor(
+    message: string,
+    readonly condition: string | undefined,
+    readonly stanzaType: string | undefined,
+  ) {
+    super(message);
+    this.name = 'XmppIqError';
+  }
 }
 
 export class XmppClient {
@@ -113,6 +125,7 @@ export class XmppClient {
     this.send(
       `<message to="${escapeXml(to)}" type="chat" id="${id}">` +
         encryptedXml +
+        `<encryption xmlns="urn:xmpp:eme:0" namespace="urn:xmpp:omemo:2"/>` +
         `<origin-id xmlns="urn:xmpp:sid:0" id="${id}"/>` +
         `<store xmlns="urn:xmpp:hints"/>` +
         `<request xmlns="urn:xmpp:receipts"/>` +
@@ -307,7 +320,7 @@ export class XmppClient {
     if (pending) {
       window.clearTimeout(pending.timer);
       this.pendingIq.delete(id);
-      if (iq.getAttribute('type') === 'error') pending.reject(new Error(xmppIqError(iq)));
+      if (iq.getAttribute('type') === 'error') pending.reject(createXmppIqError(iq));
       else pending.resolve(iq);
       return;
     }
@@ -333,6 +346,16 @@ export class XmppClient {
       const error = firstDescendant(message, 'error');
       const condition = error ? Array.from(error.children).find((child) => child.namespaceURI === 'urn:ietf:params:xml:ns:xmpp-stanzas') : undefined;
       this.emit({ type: 'message-error', id: stableMessageId(message), from: bareJid(message.getAttribute('from') ?? ''), detail: `XMPP delivery failed${condition ? `: ${condition.localName}` : ''}` });
+      return;
+    }
+    const omemoDevices = descendants(message, 'items').find((item) =>
+      item.namespaceURI === 'http://jabber.org/protocol/pubsub#event' && item.getAttribute('node') === 'urn:xmpp:omemo:2:devices');
+    if (omemoDevices) {
+      const deviceIds = descendants(omemoDevices, 'device')
+        .filter((device) => device.namespaceURI === 'urn:xmpp:omemo:2')
+        .map((device) => Number(device.getAttribute('id')))
+        .filter((id) => Number.isInteger(id) && id > 0 && id <= 0x7fffffff);
+      this.emit({ type: 'omemo-devices', from: bareJid(message.getAttribute('from') ?? ''), deviceIds: [...new Set(deviceIds)] });
       return;
     }
     const forwarded = descendants(message, 'forwarded').find((item) => item.namespaceURI === 'urn:xmpp:forward:0');
@@ -476,8 +499,13 @@ function stableMessageId(message: Element): string {
   return origin?.getAttribute('id') || message.getAttribute('id') || crypto.randomUUID();
 }
 
-function xmppIqError(iq: Element): string {
+function createXmppIqError(iq: Element): XmppIqError {
   const error = firstDescendant(iq, 'error');
   const condition = error ? Array.from(error.children).find((child) => child.namespaceURI === 'urn:ietf:params:xml:ns:xmpp-stanzas') : undefined;
-  return `XMPP request rejected${condition ? `: ${condition.localName}` : ''}`;
+  const conditionName = condition?.localName;
+  return new XmppIqError(
+    `XMPP request rejected${conditionName ? `: ${conditionName}` : ''}`,
+    conditionName,
+    error?.getAttribute('type') ?? undefined,
+  );
 }

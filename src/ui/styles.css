@@ -144,6 +144,7 @@ button.security-state { border: 0; font: inherit; cursor: pointer; }
 .encryption-modes button.active { background: #fff; color: var(--chat-blue); box-shadow: 0 1px 3px rgba(25, 49, 68, .12); }
 .encryption-modes button.active.warning { color: #9a641c; }
 .encryption-warning { margin: 10px 2px 0; color: #8a622c; font-size: 11px; line-height: 1.45; }
+.encryption-caution { margin: 10px 2px 2px; padding: 8px 10px; border-radius: 8px; background: #fff7e8; color: #855d20; font-size: 11px; line-height: 1.45; }
 .context-menu { position: fixed; z-index: 1000; width: 216px; padding: 6px; border: 1px solid rgba(42, 64, 82, .12); border-radius: 12px; background: rgba(255, 255, 255, .98); box-shadow: 0 8px 28px rgba(24, 44, 61, .16); backdrop-filter: blur(14px); animation: context-in 120ms ease-out both; }
 .context-menu button { width: 100%; min-height: 38px; display: flex; align-items: center; gap: 9px; padding: 0 11px; border: 0; border-radius: 8px; background: transparent; color: #273744; font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
 .context-menu button:hover, .context-menu button:focus-visible { background: #edf5fc; outline: none; }
@@ -161,6 +162,8 @@ button.security-state { border: 0; font: inherit; cursor: pointer; }
 .messages p { margin: 0; padding: 9px 11px 7px; border-radius: 14px 14px 14px 4px; background: #fff; box-shadow: 0 1px 1px rgba(25,45,61,.08); line-height: 1.42; overflow-wrap: anywhere; white-space: pre-wrap; }
 .messages article.outgoing p { border-radius: 14px 14px 4px 14px; background: #d9fdd3; }
 .messages article.failed p { background: #fff1f1; box-shadow: inset 0 0 0 1px #f2caca; }
+.retry-message { margin: 4px 5px 0 auto; padding: 2px 6px; display: block; border: 0; background: transparent; color: var(--chat-danger); font: inherit; font-size: 11px; font-weight: 650; cursor: pointer; }
+.retry-message:hover, .retry-message:focus-visible { color: #a82f2f; text-decoration: underline; outline: none; }
 .message-meta { float: right; margin: 6px 0 0 12px; display: inline-flex; align-items: center; gap: 3px; color: #86929d; white-space: nowrap; }
 .messages time { font-size: 10px; }
 .delivery-mark { display: inline-grid; place-content: center; }
