@@ -18,7 +18,6 @@ import { base64ToBytes, bytesToBase64, clearBytes, decodeUtf8, randomBytes, toAr
 
 const DB_NAME = 'relayless-local-vault';
 const STORE_NAME = 'encrypted';
-const DEVICE_STORE_NAME = 'device-unlock';
 const RECORD_KEY = 'vault';
 const DEVICE_KEY_RECORD = 'key';
 const DEVICE_UNLOCK_RECORD = 'wrapped-password';
@@ -97,7 +96,7 @@ export class Vault {
       );
       const record: WrappedDeviceUnlock = { version: 1, nonce: bytesToBase64(nonce), ciphertext: bytesToBase64(new Uint8Array(ciphertext)) };
       const db = await this.openDatabase();
-      const transaction = db.transaction(DEVICE_STORE_NAME, 'readwrite');
+      const transaction = db.transaction(STORE_NAME, 'readwrite');
       await transaction.store.put(key, DEVICE_KEY_RECORD);
       await transaction.store.put(record, DEVICE_UNLOCK_RECORD);
       await transaction.done;
@@ -109,7 +108,7 @@ export class Vault {
 
   async tryDeviceUnlock(): Promise<boolean> {
     const db = await this.openDatabase();
-    const transaction = db.transaction(DEVICE_STORE_NAME, 'readonly');
+    const transaction = db.transaction(STORE_NAME, 'readonly');
     const key = await transaction.store.get(DEVICE_KEY_RECORD) as CryptoKey | undefined;
     const record = await transaction.store.get(DEVICE_UNLOCK_RECORD) as WrappedDeviceUnlock | undefined;
     await transaction.done;
@@ -140,7 +139,7 @@ export class Vault {
 
   async disableDeviceUnlock(): Promise<void> {
     const db = await this.openDatabase();
-    const transaction = db.transaction(DEVICE_STORE_NAME, 'readwrite');
+    const transaction = db.transaction(STORE_NAME, 'readwrite');
     await transaction.store.delete(DEVICE_KEY_RECORD);
     await transaction.store.delete(DEVICE_UNLOCK_RECORD);
     await transaction.done;
@@ -278,10 +277,9 @@ export class Vault {
 
   private async openDatabase(): Promise<IDBPDatabase> {
     if (!this.db) {
-      this.db = await openDB(DB_NAME, 2, {
+      this.db = await openDB(DB_NAME, undefined, {
         upgrade(database) {
           if (!database.objectStoreNames.contains(STORE_NAME)) database.createObjectStore(STORE_NAME);
-          if (!database.objectStoreNames.contains(DEVICE_STORE_NAME)) database.createObjectStore(DEVICE_STORE_NAME);
         },
         blocking: () => {
           this.db?.close();
