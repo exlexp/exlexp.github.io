@@ -1,4 +1,4 @@
-import { deleteDB, openDB, type IDBPDatabase } from 'idb';
+import { deleteDB, wrap, type IDBPDatabase } from 'idb';
 import { migrateVaultData, serializableVault } from '../models/profiles';
 import { createEmptyVault, type LocalProfile, type VaultData } from '../models/types';
 import {
@@ -277,17 +277,39 @@ export class Vault {
 
   private async openDatabase(): Promise<IDBPDatabase> {
     if (!this.db) {
-      const databases = await indexedDB.databases();
-      const currentVersion = databases.find((database) => database.name === DB_NAME)?.version;
-      const version = currentVersion && currentVersion > 0 ? currentVersion : 1;
-      this.db = await openDB(DB_NAME, version, {
-        upgrade(database) {
-          if (!database.objectStoreNames.contains(STORE_NAME)) database.createObjectStore(STORE_NAME);
-        },
-        blocking: () => {
-          this.db?.close();
-          this.db = undefined;
-        },
+      const database = await new Promise<IDBPDatabase>((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME);
+        let settled = false;
+        const timeout = globalThis.setTimeout(() => {
+          settled = true;
+          reject(new Error('Local vault did not become available'));
+        }, 8_000);
+        request.addEventListener('upgradeneeded', () => {
+          if (!request.result.objectStoreNames.contains(STORE_NAME)) request.result.createObjectStore(STORE_NAME);
+        });
+        request.addEventListener('success', () => {
+          if (settled) { request.result.close(); return; }
+          settled = true;
+          globalThis.clearTimeout(timeout);
+          resolve(wrap(request.result));
+        });
+        request.addEventListener('error', () => {
+          if (settled) return;
+          settled = true;
+          globalThis.clearTimeout(timeout);
+          reject(request.error ?? new Error('Local vault could not be opened'));
+        });
+        request.addEventListener('blocked', () => {
+          if (settled) return;
+          settled = true;
+          globalThis.clearTimeout(timeout);
+          reject(new Error('Another tab is updating the local vault'));
+        });
+      });
+      this.db = database;
+      database.addEventListener('versionchange', () => {
+        database.close();
+        if (this.db === database) this.db = undefined;
       });
     }
     return this.db;
