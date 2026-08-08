@@ -14,7 +14,7 @@ import {
   type EnvelopeCipher,
   type KdfParameters,
 } from './crypto';
-import { base64ToBytes, bytesToBase64, clearBytes, decodeUtf8, randomBytes, toArrayBuffer, utf8 } from './encoding';
+import { base64ToBytes, clearBytes, decodeUtf8, toArrayBuffer, utf8 } from './encoding';
 
 const DB_NAME = 'relayless-local-vault';
 const STORE_NAME = 'encrypted';
@@ -29,11 +29,21 @@ interface WrappedDeviceUnlock {
   ciphertext: string;
 }
 
+interface StoredDeviceUnlock {
+  version: 2;
+}
+
 type Mode = 'persistent' | 'ephemeral';
+
+export class BackupPasswordRequiredError extends Error {
+  constructor() {
+    super('This profile backup was encrypted with a different vault key');
+    this.name = 'BackupPasswordRequiredError';
+  }
+}
 
 export class Vault {
   private data: VaultData | undefined;
-  private password: string | undefined;
   private db: IDBPDatabase | undefined;
   private mode: Mode = 'persistent';
   private mutationQueue: Promise<void> = Promise.resolve();
@@ -60,7 +70,6 @@ export class Vault {
   async create(password: string, language: 'ru' | 'en', kdf?: KdfParameters): Promise<void> {
     this.mode = 'persistent';
     this.data = createEmptyVault(language);
-    this.password = password;
     this.cipher = await createEnvelopeCipher(password, kdf);
     await this.persist();
   }
@@ -68,7 +77,6 @@ export class Vault {
   createEphemeral(language: 'ru' | 'en'): void {
     this.mode = 'ephemeral';
     this.data = createEmptyVault(language);
-    this.password = undefined;
     this.cipher = undefined;
   }
 
@@ -78,46 +86,43 @@ export class Vault {
     if (!envelope) throw new Error('No persistent vault exists');
     const cipher = await openEnvelopeCipher(envelope, password);
     this.data = migrateVaultData(await decryptEnvelopeWithCipher<unknown>(envelope, cipher));
-    this.password = password;
     this.cipher = cipher;
     this.mode = 'persistent';
   }
 
-  async enableDeviceUnlock(password: string): Promise<void> {
-    if (!this.data || this.mode !== 'persistent') throw new Error('Persistent vault is not unlocked');
-    const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-    const nonce = randomBytes(12);
-    const plaintext = utf8(password);
-    try {
-      const ciphertext = await crypto.subtle.encrypt(
-        { name: 'AES-GCM', iv: toArrayBuffer(nonce), additionalData: toArrayBuffer(DEVICE_UNLOCK_AAD), tagLength: 128 },
-        key,
-        toArrayBuffer(plaintext),
-      );
-      const record: WrappedDeviceUnlock = { version: 1, nonce: bytesToBase64(nonce), ciphertext: bytesToBase64(new Uint8Array(ciphertext)) };
-      const db = await this.openDatabase();
-      const transaction = db.transaction(STORE_NAME, 'readwrite');
-      await transaction.store.put(key, DEVICE_KEY_RECORD);
-      await transaction.store.put(record, DEVICE_UNLOCK_RECORD);
-      await transaction.done;
-    } finally {
-      clearBytes(nonce);
-      clearBytes(plaintext);
-    }
+  async enableDeviceUnlock(): Promise<void> {
+    if (!this.data || !this.cipher || this.mode !== 'persistent') throw new Error('Persistent vault is not unlocked');
+    const record: StoredDeviceUnlock = { version: 2 };
+    const db = await this.openDatabase();
+    const transaction = db.transaction(STORE_NAME, 'readwrite');
+    await transaction.store.put(this.cipher.key, DEVICE_KEY_RECORD);
+    await transaction.store.put(record, DEVICE_UNLOCK_RECORD);
+    await transaction.done;
   }
 
   async tryDeviceUnlock(): Promise<boolean> {
     const db = await this.openDatabase();
     const transaction = db.transaction(STORE_NAME, 'readonly');
     const key = await transaction.store.get(DEVICE_KEY_RECORD) as CryptoKey | undefined;
-    const record = await transaction.store.get(DEVICE_UNLOCK_RECORD) as WrappedDeviceUnlock | undefined;
+    const record = await transaction.store.get(DEVICE_UNLOCK_RECORD) as WrappedDeviceUnlock | StoredDeviceUnlock | undefined;
     await transaction.done;
     if (!key || !record) return false;
 
     let nonce: Uint8Array | undefined;
     let plaintext: Uint8Array | undefined;
     try {
-      if (key.extractable || key.algorithm.name !== 'AES-GCM' || !key.usages.includes('decrypt')) throw new Error('Invalid device key');
+      if (key.extractable || key.algorithm.name !== 'AES-GCM' || !key.usages.includes('encrypt') || !key.usages.includes('decrypt')) {
+        throw new Error('Invalid device key');
+      }
+      if (record.version === 2) {
+        const envelope = (await db.get(STORE_NAME, RECORD_KEY)) as EncryptedEnvelope | undefined;
+        if (!envelope) throw new Error('No persistent vault exists');
+        const cipher: EnvelopeCipher = { key, salt: envelope.salt, kdfParameters: { ...envelope.kdfParameters } };
+        this.data = migrateVaultData(await decryptEnvelopeWithCipher<unknown>(envelope, cipher));
+        this.cipher = cipher;
+        this.mode = 'persistent';
+        return true;
+      }
       if (record.version !== 1 || record.nonce.length > 64 || record.ciphertext.length > 4096) throw new Error('Invalid device unlock record');
       nonce = base64ToBytes(record.nonce);
       if (nonce.byteLength !== 12) throw new Error('Invalid device unlock nonce');
@@ -127,6 +132,7 @@ export class Vault {
         toArrayBuffer(base64ToBytes(record.ciphertext)),
       ));
       await this.unlock(decodeUtf8(toArrayBuffer(plaintext)));
+      await this.enableDeviceUnlock();
       return true;
     } catch {
       await this.disableDeviceUnlock();
@@ -159,7 +165,6 @@ export class Vault {
 
   lock(): void {
     this.data = undefined;
-    this.password = undefined;
     this.cipher = undefined;
     this.db?.close();
     this.db = undefined;
@@ -171,7 +176,6 @@ export class Vault {
     const envelope = (await db.get(STORE_NAME, RECORD_KEY)) as EncryptedEnvelope;
     await decryptEnvelope(envelope, currentPassword);
     const cipher = await createEnvelopeCipher(nextPassword);
-    this.password = nextPassword;
     this.cipher = cipher;
     await this.persist();
     await this.disableDeviceUnlock();
@@ -187,19 +191,19 @@ export class Vault {
   }
 
   async exportProfile(profileId: string): Promise<string> {
-    if (!this.data || !this.password || this.mode !== 'persistent') {
+    if (!this.data || !this.cipher || this.mode !== 'persistent') {
       throw new Error('A persistent vault must be unlocked to export a profile');
     }
     const profile = this.data.profiles.find((item) => item.id === profileId);
     if (!profile) throw new Error('Profile does not exist');
     if (profile.ephemeral) throw new Error('Ephemeral profiles cannot be exported');
-    return serializeEnvelope(await encryptEnvelope({ kind: 'relayless-profile', version: 1, profile }, this.password));
+    return serializeEnvelope(await encryptEnvelopeWithCipher({ kind: 'relayless-profile', version: 1, profile }, this.cipher));
   }
 
   async exportAccount(profileId: string, accountId: string, exportPassword?: string): Promise<string> {
     if (!this.data) throw new Error('The vault must be unlocked to export an account');
-    const password = this.mode === 'persistent' ? this.password : exportPassword;
-    if (!password) throw new Error('A backup password is required for an ephemeral account');
+    if (this.mode === 'persistent' && !this.cipher) throw new Error('Persistent vault is not unlocked');
+    if (this.mode === 'ephemeral' && !exportPassword) throw new Error('A backup password is required for an ephemeral account');
     await this.mutationQueue;
     const profile = this.data.profiles.find((item) => item.id === profileId);
     const account = profile?.accounts.find((item) => item.id === accountId);
@@ -221,17 +225,23 @@ export class Vault {
       messages,
       drafts,
     };
-    return serializeEnvelope(await encryptEnvelope(payload, password));
+    const envelope = this.mode === 'persistent'
+      ? await encryptEnvelopeWithCipher(payload, this.cipher!)
+      : await encryptEnvelope(payload, exportPassword!);
+    return serializeEnvelope(envelope);
   }
 
-  async importProfile(serialized: string): Promise<string> {
-    if (!this.data || !this.password || this.mode !== 'persistent') {
+  async importProfile(serialized: string, backupPassword?: string): Promise<string> {
+    if (!this.data || !this.cipher || this.mode !== 'persistent') {
       throw new Error('A persistent vault must be unlocked to import a profile');
     }
-    const payload = await decryptEnvelope<{ kind: string; version: number; profile: LocalProfile }>(
-      parseEnvelope(serialized),
-      this.password,
-    );
+    const envelope = parseEnvelope(serialized);
+    const sameCipher = envelope.salt === this.cipher.salt
+      && JSON.stringify(envelope.kdfParameters) === JSON.stringify(this.cipher.kdfParameters);
+    if (!sameCipher && !backupPassword) throw new BackupPasswordRequiredError();
+    const payload = sameCipher
+      ? await decryptEnvelopeWithCipher<{ kind: string; version: number; profile: LocalProfile }>(envelope, this.cipher)
+      : await decryptEnvelope<{ kind: string; version: number; profile: LocalProfile }>(envelope, backupPassword!);
     if (payload.kind !== 'relayless-profile' || payload.version !== 1 || !payload.profile?.id) {
       throw new Error('Invalid encrypted profile backup');
     }
@@ -254,7 +264,6 @@ export class Vault {
     const db = await this.openDatabase();
     await db.put(STORE_NAME, envelope, RECORD_KEY);
     this.data = data;
-    this.password = password;
     this.cipher = cipher;
     this.mode = 'persistent';
     await this.disableDeviceUnlock();
@@ -269,7 +278,7 @@ export class Vault {
   }
 
   private async persist(): Promise<void> {
-    if (!this.data || !this.password || !this.cipher) throw new Error('Persistent vault is not unlocked');
+    if (!this.data || !this.cipher) throw new Error('Persistent vault is not unlocked');
     const envelope = await encryptEnvelopeWithCipher(serializableVault(this.data), this.cipher);
     const db = await this.openDatabase();
     await db.put(STORE_NAME, envelope, RECORD_KEY);

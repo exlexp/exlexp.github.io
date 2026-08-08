@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { openDB } from 'idb';
 import { Vault } from './vault';
+import { encryptEnvelope, serializeEnvelope } from './crypto';
 
 describe('vault persistence', () => {
   const vault = new Vault();
@@ -24,7 +26,7 @@ describe('vault persistence', () => {
     const password = 'a sufficiently long password';
     await vault.create(password, 'en', { iterations: 1, memoryKiB: 64, parallelism: 1 });
     await vault.update((draft) => { draft.profiles[0]!.name = 'Remembered locally'; });
-    await vault.enableDeviceUnlock(password);
+    await vault.enableDeviceUnlock();
     vault.lock();
 
     const refreshedVault = new Vault();
@@ -33,10 +35,22 @@ describe('vault persistence', () => {
     refreshedVault.lock();
   });
 
+  it('does not keep a reusable password in the device-unlock record', async () => {
+    await vault.create('a sufficiently long password', 'en', { iterations: 1, memoryKiB: 64, parallelism: 1 });
+    await vault.enableDeviceUnlock();
+    const db = await openDB('relayless-local-vault');
+    const record = await db.get('encrypted', 'wrapped-password') as Record<string, unknown>;
+    const key = await db.get('encrypted', 'key') as CryptoKey;
+    db.close();
+    expect(record).toEqual({ version: 2 });
+    expect(key.extractable).toBe(false);
+    expect(key.usages).toEqual(expect.arrayContaining(['encrypt', 'decrypt']));
+  });
+
   it('forgets device unlock when explicitly disabled', async () => {
     const password = 'a sufficiently long password';
     await vault.create(password, 'en', { iterations: 1, memoryKiB: 64, parallelism: 1 });
-    await vault.enableDeviceUnlock(password);
+    await vault.enableDeviceUnlock();
     await vault.disableDeviceUnlock();
     vault.lock();
 
@@ -82,6 +96,20 @@ describe('vault persistence', () => {
     const importedId = await vault.importProfile(backup);
     expect(importedId).not.toBe(originalId);
     expect(vault.snapshot.profiles.find((profile) => profile.id === importedId)?.accounts[0]?.secret).toBe('profile-secret');
+  });
+
+  it('imports legacy profile backups with their original password', async () => {
+    await vault.create('a sufficiently long password', 'en', { iterations: 1, memoryKiB: 64, parallelism: 1 });
+    const profile = vault.snapshot.profiles[0]!;
+    profile.name = 'Legacy profile';
+    const backup = serializeEnvelope(await encryptEnvelope(
+      { kind: 'relayless-profile', version: 1, profile },
+      'legacy backup password',
+      { iterations: 1, memoryKiB: 64, parallelism: 1 },
+    ));
+    await expect(vault.importProfile(backup)).rejects.toThrow(/different vault key/i);
+    const importedId = await vault.importProfile(backup, 'legacy backup password');
+    expect(vault.snapshot.profiles.find((item) => item.id === importedId)?.name).toContain('Legacy profile');
   });
 
   it('exports one account and its related history without plaintext leakage', async () => {

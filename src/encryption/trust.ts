@@ -41,3 +41,25 @@ export function setDeviceTrust(
 export function formatFingerprint(value: string): string {
   return value.replace(/[^a-fA-F0-9]/g, '').toUpperCase().match(/.{1,8}/g)?.join(' ') ?? '';
 }
+
+export function reconcileDeviceSnapshot(
+  previous: EncryptionDevice[],
+  current: Array<Pick<EncryptionDevice, 'id' | 'label' | 'fingerprint'>>,
+  now = Date.now(),
+): { devices: EncryptionDevice[]; verified: boolean; requiresTrustReview: boolean; changed: boolean } {
+  const devices = current.map((item) => {
+    const sameIdentity = previous.find((known) => known.id === item.id && known.fingerprint === item.fingerprint);
+    const reusedId = previous.find((known) => known.id === item.id);
+    return {
+      ...item,
+      trust: sameIdentity?.trust ?? 'untrusted' as const,
+      firstSeenAt: sameIdentity?.firstSeenAt ?? now,
+      changedAt: reusedId && reusedId.fingerprint !== item.fingerprint ? now : sameIdentity?.changedAt,
+    };
+  });
+  const changed = devices.some((item) => item.changedAt === now);
+  const verified = devices.length > 0 && devices.every((item) => item.trust === 'trusted');
+  const requiresTrustReview = previous.some((item) => item.trust === 'trusted')
+    && devices.some((item) => item.trust !== 'trusted');
+  return { devices, verified, requiresTrustReview, changed };
+}

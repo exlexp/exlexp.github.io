@@ -11,7 +11,8 @@ import { hasToxTransport } from '../protocols/tox/gatewayConfig';
 import type { ToxEvent } from '../protocols/tox/types';
 import { availablePluginCommands, installPlugin, parsePluginManifest } from '../plugins/host';
 import { redactError } from '../security/redaction';
-import { Vault } from '../security/vault';
+import { BackupPasswordRequiredError, Vault } from '../security/vault';
+import { SessionLease } from '../security/sessionLease';
 import { copy, type Language } from './i18n';
 import { AccountsIcon, ArrowIcon, CancelIcon, ChatIcon, ContactsIcon, DeliveredIcon, DownloadIcon, EditIcon, FailedIcon, LockIcon, PendingIcon, PluginsIcon, PlusIcon, SearchIcon, SendIcon, SentIcon, SettingsIcon, ShieldIcon, ToxIcon, UserIcon, XmppIcon } from './icons';
 import { CommandPalette } from './CommandPalette';
@@ -22,11 +23,13 @@ import { requestLocalNotifications, showLocalMessageNotification } from './notif
 import { XmppAccountSetup } from './XmppAccountSetup';
 import type { OmemoEngine } from '../encryption/omemo';
 import { OtrManager, type OtrEvent } from '../encryption/otr';
+import { reconcileDeviceSnapshot } from '../encryption/trust';
 
 type Screen = 'chats' | 'accounts' | 'contacts' | 'privacy' | 'plugins' | 'settings';
-type Gate = 'loading' | 'launch' | 'unlock' | 'open';
+type Gate = 'loading' | 'launch' | 'unlock' | 'busy' | 'open';
 
 const vault = new Vault();
+const sessionLease = new SessionLease();
 const TOX_MESSAGE_MAX_BYTES = 1372;
 const XMPP_MESSAGE_MAX_BYTES = 64 * 1024;
 const MESSAGE_RENDER_BATCH = 200;
@@ -60,6 +63,7 @@ export function App() {
       try {
         const exists = await vault.exists();
         if (!exists) { setGate('launch'); return; }
+        if (!(await sessionLease.acquire())) { setGate('busy'); return; }
         if (await vault.tryDeviceUnlock()) { refresh(); setGate('open'); void requestDurableStorage(); return; }
         setGate('unlock');
       } catch (reason) {
@@ -147,7 +151,7 @@ export function App() {
 
   const createPersistent = async (password: string, rememberDevice: boolean) => {
     setError('');
-    try { await vault.create(password, language); if (rememberDevice) await vault.enableDeviceUnlock(password); refresh(); setGate('open'); void requestDurableStorage(); }
+    try { if (!(await sessionLease.acquire())) { setGate('busy'); return; } await vault.create(password, language); if (rememberDevice) await vault.enableDeviceUnlock(); refresh(); setGate('open'); void requestDurableStorage(); }
     catch (reason) { setError(redactError(reason)); }
   };
 
@@ -155,7 +159,7 @@ export function App() {
 
   const unlock = async (password: string, rememberDevice: boolean) => {
     setError('');
-    try { await vault.unlock(password); if (rememberDevice) await vault.enableDeviceUnlock(password); else await vault.disableDeviceUnlock(); refresh(); setGate('open'); void requestDurableStorage(); }
+    try { if (!(await sessionLease.acquire())) { setGate('busy'); return; } await vault.unlock(password); if (rememberDevice) await vault.enableDeviceUnlock(); else await vault.disableDeviceUnlock(); refresh(); setGate('open'); void requestDurableStorage(); }
     catch (reason) { setError(redactError(reason)); }
   };
 
@@ -172,6 +176,7 @@ export function App() {
   if (gate === 'loading') return <div className="boot"/>;
   if (gate === 'launch') return <FirstLaunch language={language} setLanguage={setLanguage} error={error} createPersistent={createPersistent} createEphemeral={createEphemeral}/>;
   if (gate === 'unlock') return <Unlock language={language} setLanguage={setLanguage} error={error} unlock={unlock}/>;
+  if (gate === 'busy') return <ActiveTabNotice language={language}/>;
   if (!data) return null;
 
   const currentProfile = activeProfile(data);
@@ -792,26 +797,36 @@ export function App() {
             const engine = omemoEngines.current.get(`${profileId}:${sourceAccountId}`);
             if (!engine) throw new Error('OMEMO is not ready; message was not sent');
             const encrypted = await engine.encrypt(contact.address, body);
-            const messageId = client.sendEncryptedMessage(contact.address, encrypted.xml, encrypted.namespace, Boolean(source.mamEnabled));
+            let requiresTrustReview = false;
             await vault.update((draft) => {
               const current = draft.profiles.find((item) => item.id === profileId)?.conversations.find((item) => item.id === conversation.id);
               if (!current) return;
               const previous = current.encryption?.devices ?? [];
               const recipientDevices = encrypted.devices.filter((item) => item.jid === contact.address.split('/')[0]);
-              const devices = recipientDevices.map((item) => ({
-                  id: `${item.jid}:${item.deviceId}`, label: `XMPP ${item.deviceId}`, fingerprint: item.fingerprint,
-                  trust: previous.find((known) => known.fingerprint === item.fingerprint)?.trust ?? 'untrusted', firstSeenAt: Date.now(),
-                }));
-              const verified = devices.length > 0 && devices.every((item) => item.trust === 'trusted');
+              const reconciled = reconcileDeviceSnapshot(previous, recipientDevices.map((item) => ({
+                id: `${item.jid}:${item.deviceId}`,
+                label: `XMPP ${item.deviceId}`,
+                fingerprint: item.fingerprint,
+              })));
+              requiresTrustReview = reconciled.requiresTrustReview;
               current.encryption = {
-                policy: current.encryption?.policy ?? 'secure-auto', provider: 'omemo', verified,
-                devices,
-                warning: encrypted.skippedDevices.some((item) => item.jid === contact.address.split('/')[0])
+                policy: current.encryption?.policy ?? 'secure-auto', provider: 'omemo', verified: reconciled.verified,
+                devices: reconciled.devices,
+                warning: reconciled.changed
+                  ? 'changed-device'
+                  : encrypted.skippedDevices.some((item) => item.jid === contact.address.split('/')[0])
                   ? 'stale-device'
-                  : verified ? undefined : 'first-use',
+                  : reconciled.verified ? undefined : 'first-use',
                 skippedDevices: encrypted.skippedDevices.filter((item) => item.jid === contact.address.split('/')[0]).length || undefined,
               };
             });
+            if (requiresTrustReview) {
+              throw new Error(languageHint(t,
+                'У контакта появилось новое или изменённое устройство OMEMO. Сообщение не отправлено — сначала проверьте отпечаток и явно доверьте устройство.',
+                'A new or changed OMEMO device appeared. The message was not sent — verify its fingerprint and trust it explicitly.',
+              ));
+            }
+            const messageId = client.sendEncryptedMessage(contact.address, encrypted.xml, encrypted.namespace, Boolean(source.mamEnabled));
             return messageId;
           }
           if (provider === 'otr') {
@@ -1102,7 +1117,7 @@ export function App() {
           {screen === 'contacts' && <Contacts profile={currentProfile} acceptToxFriend={acceptToxFriend} rejectToxFriend={rejectToxFriend} addXmppContact={addXmppContact} addToxFriend={addToxFriend} openContact={openContact} renameContact={renameContact} deleteContact={deleteContact} goToAccounts={() => setScreen('accounts')} t={t}/>}
           {screen === 'privacy' && <Privacy data={data} profile={currentProfile} network={network} t={t} onLock={() => void lock()} onWipe={async () => { await vault.wipe(); setData(undefined); setGate('launch'); }} onExport={async () => downloadText(await vault.exportEncrypted(), 'relayless-vault.rlvault')}/>}
           {screen === 'plugins' && <Plugins data={data} t={t} onInstall={async (source, granted) => { const manifest = parsePluginManifest(source); await vault.update((draft) => { draft.plugins = installPlugin(manifest, granted, draft.plugins); }); refresh(); }} onToggle={async (id) => { await vault.update((draft) => { const plugin = draft.plugins.find((item) => item.manifest.id === id); if (plugin) plugin.enabled = !plugin.enabled; }); refresh(); }} onRemove={async (id) => { await vault.update((draft) => { draft.plugins = draft.plugins.filter((item) => item.manifest.id !== id); }); refresh(); }}/>}
-          {screen === 'settings' && <Settings data={data} profile={currentProfile} t={t} onSave={updateSettings} onProfileUpdate={async (settings) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.settings = settings; }); refresh(); }} onRename={async (name) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) { profile.name = name; profile.initials = name.slice(0, 2).toUpperCase(); } }); refresh(); }} onPin={async () => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.pinned = !profile.pinned; }); refresh(); }} onAvatar={async (avatar) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.avatar = avatar; }); refresh(); }} onLockProfile={async () => { for (const account of currentProfile.accounts) { const key = `${currentProfile.id}:${account.id}`; xmppClients.current.get(key)?.stop(); xmppClients.current.delete(key); omemoEngines.current.delete(key); void toxClients.current.get(key)?.stop(); toxClients.current.delete(key); } await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) { profile.locked = true; profile.runtimeState = 'locked'; } }); refresh(); setProfileScope('all'); setSelectedConversation(undefined); setScreen('chats'); }} onDuplicate={async () => { await vault.update((draft) => duplicateProfileSettings(draft, currentProfile.id, `${currentProfile.name} copy`)); refresh(); }} onEphemeral={() => void createNewProfile(true)} onDelete={async () => { for (const account of currentProfile.accounts) { const key = `${currentProfile.id}:${account.id}`; xmppClients.current.get(key)?.stop(); omemoEngines.current.delete(key); void toxClients.current.get(key)?.stop(); } await vault.update((draft) => deleteProfile(draft, currentProfile.id)); refresh(); }} onExportProfile={async () => downloadText(await vault.exportProfile(currentProfile.id), `${safeFilename(currentProfile.name)}.rlprofile`)} onImportProfile={async (text) => { const id = await vault.importProfile(text); refresh(); await selectProfile(id); }}/>}
+          {screen === 'settings' && <Settings data={data} profile={currentProfile} t={t} onSave={updateSettings} onProfileUpdate={async (settings) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.settings = settings; }); refresh(); }} onRename={async (name) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) { profile.name = name; profile.initials = name.slice(0, 2).toUpperCase(); } }); refresh(); }} onPin={async () => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.pinned = !profile.pinned; }); refresh(); }} onAvatar={async (avatar) => { await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) profile.avatar = avatar; }); refresh(); }} onLockProfile={async () => { for (const account of currentProfile.accounts) { const key = `${currentProfile.id}:${account.id}`; xmppClients.current.get(key)?.stop(); xmppClients.current.delete(key); omemoEngines.current.delete(key); void toxClients.current.get(key)?.stop(); toxClients.current.delete(key); } await vault.update((draft) => { const profile = draft.profiles.find((item) => item.id === currentProfile.id); if (profile) { profile.locked = true; profile.runtimeState = 'locked'; } }); refresh(); setProfileScope('all'); setSelectedConversation(undefined); setScreen('chats'); }} onDuplicate={async () => { await vault.update((draft) => duplicateProfileSettings(draft, currentProfile.id, `${currentProfile.name} copy`)); refresh(); }} onEphemeral={() => void createNewProfile(true)} onDelete={async () => { for (const account of currentProfile.accounts) { const key = `${currentProfile.id}:${account.id}`; xmppClients.current.get(key)?.stop(); omemoEngines.current.delete(key); void toxClients.current.get(key)?.stop(); } await vault.update((draft) => deleteProfile(draft, currentProfile.id)); refresh(); }} onExportProfile={async () => downloadText(await vault.exportProfile(currentProfile.id), `${safeFilename(currentProfile.name)}.rlprofile`)} onImportProfile={async (text) => { let id: string; try { id = await vault.importProfile(text); } catch (reason) { if (!(reason instanceof BackupPasswordRequiredError)) throw reason; const password = window.prompt(languageHint(t, 'Пароль от резервной копии', 'Backup password')); if (!password) return; id = await vault.importProfile(text, password); } refresh(); await selectProfile(id); }}/>}
           </WorkspaceErrorBoundary>
         </main>
       </div>
@@ -1171,6 +1186,11 @@ function Messenger({ data, scope, selected, onBack, selectConversation, setScree
     { label: languageHint(t, 'Копировать последнее сообщение', 'Copy last message'), disabled: !latest, action: () => navigator.clipboard.writeText(latest?.body ?? '') },
     { label: languageHint(t, 'Удалить чат', 'Delete chat'), danger: true, action: () => { if (window.confirm(languageHint(t, `Удалить чат «${conversation.title}» и его локальную историю?`, `Delete “${conversation.title}” and its local history?`))) return deleteConversation(owner.id, conversation.id); } },
   ]}/>; })()}</div>;
+}
+
+function ActiveTabNotice({ language }: { language: Language }) {
+  const ru = language === 'ru';
+  return <div className="unlock-page"><main className="unlock-box"><div className="unlock-avatar"><LockIcon/></div><h1>{ru ? 'Relayless уже открыт' : 'Relayless is already open'}</h1><p>{ru ? 'Другая вкладка использует локальные ключи. Закройте её и обновите эту страницу — так контакты и ключи OMEMO не повредятся.' : 'Another tab is using the local keys. Close it and reload this page to protect contacts and OMEMO ratchets from conflicting writes.'}</p><button className="primary" onClick={() => window.location.reload()}>{ru ? 'Проверить снова' : 'Try again'}</button></main></div>;
 }
 
 type ActiveChatProps = {
@@ -1432,7 +1452,7 @@ function ContactRow({ contact, open, rename, remove, t }: { contact: Contact; op
 
 function Privacy({ data, profile, network, t, onLock, onWipe, onExport }: { data: VaultData; profile: LocalProfile; network: NetworkActivity[]; t: typeof copy[Language]; onLock: () => void; onWipe: () => Promise<void>; onExport: () => Promise<void> }) {
   const messageCount = data.profiles.reduce((count, item) => count + item.messages.length, 0);
-  return <div className="single-page privacy-page"><PageTitle index="04" title={t.privacy} subtitle={profile.name}/><section className="summary-list"><div><span>{languageHint(t, 'Сообщения на устройстве', 'Messages on device')}</span><strong>{messageCount}</strong></div><div><span>{t.currentConnections}</span><strong>{network.filter((item) => item.state === 'open').length}</strong></div></section><p className="simple-notice">{languageHint(t, 'Хранилище, пароли, OMEMO-ключи и история остаются в зашифрованном виде на этом устройстве. Аналитики и трекеров нет. GitHub видит обычные данные веб-запроса (например IP и время), выбранный XMPP-сервер — JID и метаданные доставки, а Cloudflare Tox-шлюз — IP, время и объём зашифрованного трафика. Содержимое Tox и OMEMO-сообщений этим посредникам недоступно.', 'The vault, passwords, OMEMO keys, and history stay encrypted on this device. There are no analytics or trackers. GitHub sees ordinary web-request metadata such as IP and time, the selected XMPP server sees JIDs and delivery metadata, and the Cloudflare Tox gateway sees IP, timing, and encrypted traffic volume. These intermediaries cannot read Tox or OMEMO message content.')}</p><section className="vault-actions"><button onClick={() => void onExport()}><DownloadIcon/><span><strong>{languageHint(t, 'Скачать резервную копию', 'Download backup')}</strong><small>{languageHint(t, 'Копия защищена вашим паролем', 'Protected with your password')}</small></span><ArrowIcon/></button><button onClick={onLock}><LockIcon/><span><strong>{t.lock}</strong><small>{languageHint(t, 'Потребуется снова ввести пароль', 'You will need to enter your password again')}</small></span><ArrowIcon/></button><button className="danger" onClick={() => { if (window.confirm(t.dangerWipe)) void onWipe(); }}><span className="delete-x">×</span><span><strong>{t.wipe}</strong><small>{t.dangerWipe}</small></span><ArrowIcon/></button></section></div>;
+  return <div className="single-page privacy-page"><PageTitle index="04" title={t.privacy} subtitle={profile.name}/><section className="summary-list"><div><span>{languageHint(t, 'Сообщения на устройстве', 'Messages on device')}</span><strong>{messageCount}</strong></div><div><span>{t.currentConnections}</span><strong>{network.filter((item) => item.state === 'open').length}</strong></div></section><p className="simple-notice">{languageHint(t, 'На диске хранилище, пароли, ключи и история зашифрованы; аналитики и рекламных трекеров в приложении нет. Пока хранилище открыто, код страницы имеет доступ к данным — поэтому GitHub Pages и целостность сборки остаются границей доверия. GitHub получает IP, время и параметры веб-запроса; XMPP-сервер видит JID, контакты, присутствие, адресата и время, а при режиме TLS — ещё и текст; Cloudflare Tox-шлюз видит IP, время, выбранный TCP-релей и объём трафика. OMEMO и Tox скрывают содержимое, но не эти метаданные. Абсолютную анонимность браузерный клиент гарантировать не может.', 'The vault, passwords, keys, and history are encrypted at rest, and the app contains no analytics or advertising trackers. While unlocked, page code can access the data, so the GitHub Pages origin and build integrity remain part of the trust boundary. GitHub receives IP, time, and web-request properties; an XMPP server sees JIDs, roster, presence, recipient, and timing, plus message text in TLS-only mode; the Cloudflare Tox gateway sees IP, timing, the selected TCP relay, and traffic volume. OMEMO and Tox hide content, not this metadata. A browser client cannot guarantee absolute anonymity.')}</p><section className="vault-actions"><button onClick={() => void onExport()}><DownloadIcon/><span><strong>{languageHint(t, 'Скачать резервную копию', 'Download backup')}</strong><small>{languageHint(t, 'Копия защищена вашим паролем', 'Protected with your password')}</small></span><ArrowIcon/></button><button onClick={onLock}><LockIcon/><span><strong>{t.lock}</strong><small>{languageHint(t, 'Потребуется снова ввести пароль', 'You will need to enter your password again')}</small></span><ArrowIcon/></button><button className="danger" onClick={() => { if (window.confirm(t.dangerWipe)) void onWipe(); }}><span className="delete-x">×</span><span><strong>{t.wipe}</strong><small>{t.dangerWipe}</small></span><ArrowIcon/></button></section></div>;
 }
 
 function Plugins({ data, t, onInstall, onToggle, onRemove }: { data: VaultData; t: typeof copy[Language]; onInstall: (source: string, granted: PluginPermission[]) => Promise<void>; onToggle: (id: string) => Promise<void>; onRemove: (id: string) => Promise<void> }) {
