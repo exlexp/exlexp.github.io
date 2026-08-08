@@ -8,6 +8,7 @@ import { OmemoEngine, OmemoUnavailableError } from './omemo';
 
 class PepServer {
   private readonly items = new Map<string, string>();
+  readonly publications: string[] = [];
 
   setDevices(jid: string, ids: number[]): void {
     this.items.set(this.key(jid, 'urn:xmpp:omemo:2:devices', 'current'), `<devices xmlns="urn:xmpp:omemo:2">${ids.map((id) => `<device id="${id}"/>`).join('')}</devices>`);
@@ -15,6 +16,14 @@ class PepServer {
 
   removeNode(jid: string, node: string): void {
     for (const key of this.items.keys()) if (key.startsWith(`${jid}\u0000${node}\u0000`)) this.items.delete(key);
+  }
+
+  getDevices(jid: string, namespace = 'urn:xmpp:omemo:2'): number[] {
+    const node = namespace === 'urn:xmpp:omemo:2' ? `${namespace}:devices` : 'eu.siacs.conversations.axolotl.devicelist';
+    const xml = this.items.get(this.key(jid, node, 'current'));
+    if (!xml) return [];
+    const root = parseXmppElement(xml);
+    return Array.from(root.getElementsByTagNameNS(namespace, 'device')).map((item) => Number(item.getAttribute('id')));
   }
 
   private key(jid: string, node: string, id: string): string {
@@ -34,6 +43,7 @@ class PepServer {
           if (!content) throw new Error('empty PEP publication');
           const serialized = new XMLSerializer().serializeToString(content);
           this.items.set(this.key(jid, node ?? '', item.getAttribute('id') ?? 'current'), serialized);
+          this.publications.push(node ?? '');
           return parseXmppElement('<iq type="result"/>');
         }
         const target = options?.to ?? jid;
@@ -121,6 +131,21 @@ describe('OMEMO engine', () => {
     pep.setDevices('bob@example.test', [424242]);
 
     await expect(alice.encrypt('bob@example.test', 'must not leak')).rejects.toBeInstanceOf(OmemoUnavailableError);
+  }, 30_000);
+
+  it('re-announces itself when another client overwrites its own device list', async () => {
+    const dom = new JSDOM('');
+    Object.assign(globalThis, { DOMParser: dom.window.DOMParser, XMLSerializer: dom.window.XMLSerializer });
+    const pep = new PepServer();
+    const alice = await OmemoEngine.open(pep.client('alice@example.test'), 'alice@example.test', undefined, async () => undefined);
+    await alice.announce();
+    pep.setDevices('alice@example.test', [123456]);
+    pep.publications.length = 0;
+
+    await alice.updateDeviceList('alice@example.test', [123456]);
+
+    expect(pep.getDevices('alice@example.test')).toEqual(expect.arrayContaining([123456, alice.deviceId]));
+    expect(pep.publications.slice(-2)).toEqual(['urn:xmpp:omemo:2:bundles', 'urn:xmpp:omemo:2:devices']);
   }, 30_000);
 
   it('interoperates bidirectionally with a Dino-style legacy-only OMEMO peer', async () => {

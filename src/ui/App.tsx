@@ -382,7 +382,8 @@ export function App() {
         setError(event.detail);
       }
       if (event.type === 'omemo-devices') {
-        omemoEngines.current.get(key)?.updateDeviceList(event.from, event.deviceIds, event.namespace);
+        void omemoEngines.current.get(key)?.updateDeviceList(event.from, event.deviceIds, event.namespace)
+          .catch((reason) => setError(`OMEMO: ${redactError(reason)}`));
       }
     });
     xmppClients.current.set(key, client);

@@ -48,6 +48,7 @@ export class OmemoEngine {
   private readonly legacyStore = new InMemoryStore();
   private readonly deviceCache = new Map<string, DeviceCacheEntry>();
   private readonly subscriptions = new Set<string>();
+  private readonly reannouncements = new Map<OMEMOVersion, Promise<void>>();
 
   private constructor(
     private readonly client: XmppClient,
@@ -77,13 +78,22 @@ export class OmemoEngine {
 
   get deviceId(): number { return this.state.deviceId; }
 
-  updateDeviceList(jid: string, ids: number[], version: OMEMOVersion = OMEMO_NS): void {
+  async updateDeviceList(jid: string, ids: number[], version: OMEMOVersion = OMEMO_NS): Promise<void> {
     const bare = bareJid(jid);
     if (!bare.includes('@')) return;
+    const normalized = [...new Set(ids.filter(validDeviceId))].slice(0, MAX_REMOTE_DEVICES);
     this.deviceCache.set(cacheKey(bare, version), {
       expiresAt: Date.now() + CACHE_TTL_MS,
-      ids: [...new Set(ids.filter(validDeviceId))].slice(0, MAX_REMOTE_DEVICES),
+      ids: normalized,
     });
+    if (bare !== this.ownJid || normalized.includes(this.deviceId)) return;
+    const inFlight = this.reannouncements.get(version);
+    if (inFlight) return inFlight;
+    const reannouncement = this.announceVersion(version).finally(() => {
+      if (this.reannouncements.get(version) === reannouncement) this.reannouncements.delete(version);
+    });
+    this.reannouncements.set(version, reannouncement);
+    return reannouncement;
   }
 
   async warmup(recipientJid: string): Promise<void> {
@@ -377,8 +387,9 @@ export class OmemoEngine {
     if (!devices.includes(this.deviceId)) devices.push(this.deviceId);
     const normalized = [...new Set(devices)].slice(0, MAX_REMOTE_DEVICES);
     const deviceXml = normalized.map((id) => `<device id="${id}"/>`).join('');
-    await this.publishDeviceList(deviceXml, version);
+    // Never advertise a device before peers can fetch its key bundle.
     await this.publishBundle(version);
+    await this.publishDeviceList(deviceXml, version);
     this.deviceCache.set(cacheKey(this.ownJid, version), { expiresAt: Date.now() + CACHE_TTL_MS, ids: normalized });
   }
 
